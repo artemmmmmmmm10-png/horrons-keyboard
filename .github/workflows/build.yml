@@ -120,6 +120,25 @@ jobs:
           object Ai {
               private val main = Handler(Looper.getMainLooper())
 
+              /** Настройки сервиса: адрес и модель по умолчанию. */
+              private class Svc(val base: String, val model: String)
+
+              /** Определяет сервис по префиксу ключа. Если адрес или модель заданы вручную, они главнее. */
+              private fun resolve(url: String, key: String, model: String): Svc {
+                  val d = when {
+                      key.startsWith("sk-ant-") -> Svc("https://api.anthropic.com", "claude-haiku-5-5")
+                      key.startsWith("sk-or-") -> Svc("https://openrouter.ai/api/v1", "openai/gpt-4o-mini")
+                      key.startsWith("gsk_") -> Svc("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile")
+                      key.startsWith("AIza") -> Svc("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-latest")
+                      key.startsWith("xai-") -> Svc("https://api.x.ai/v1", "grok-3-mini")
+                      key.startsWith("sk-") -> Svc("https://api.openai.com/v1", "gpt-4o-mini")
+                      else -> Svc("https://api.openai.com/v1", "gpt-4o-mini")
+                  }
+                  val u = url.trim()
+                  val m = model.trim()
+                  return Svc(if (u.isEmpty() || u.equals("auto", true)) d.base else u, if (m.isEmpty()) d.model else m)
+              }
+
               /** Колбэк вызывается в главном потоке: (ответ, ошибка). */
               fun ask(
                   baseUrl: String,
@@ -133,7 +152,10 @@ jobs:
                       var res: String? = null
                       var err: String? = null
                       try {
-                          val base = baseUrl.trim().trimEnd('/')
+                          // ключ могут вставить с пробелами, переносами и кавычками
+                          val k = key.trim().trim('"', '\'', '«', '»').replace(Regex("\\s"), "")
+                          val svc = resolve(baseUrl, k, model)
+                          val base = svc.base.trim().trimEnd('/')
                           val anthropic = base.contains("anthropic.com")
                           val url = URL(if (anthropic) "$base/v1/messages" else "$base/chat/completions")
                           val c = url.openConnection() as HttpURLConnection
@@ -144,10 +166,10 @@ jobs:
                           c.setRequestProperty("Content-Type", "application/json")
 
                           val body = JSONObject()
-                          body.put("model", model.trim())
+                          body.put("model", svc.model)
                           body.put("max_tokens", 1024)
                           if (anthropic) {
-                              c.setRequestProperty("x-api-key", key.trim())
+                              c.setRequestProperty("x-api-key", k)
                               c.setRequestProperty("anthropic-version", "2023-06-01")
                               body.put("system", system)
                               body.put(
@@ -155,7 +177,7 @@ jobs:
                                   JSONArray().put(JSONObject().put("role", "user").put("content", user))
                               )
                           } else {
-                              c.setRequestProperty("Authorization", "Bearer " + key.trim())
+                              c.setRequestProperty("Authorization", "Bearer " + k)
                               body.put(
                                   "messages",
                                   JSONArray()
@@ -205,7 +227,7 @@ jobs:
                   val base = when (code) {
                       401 -> "Ключ не подошёл (401)."
                       403 -> "Доступ закрыт (403). Возможно, сервис недоступен в вашей стране: нужен VPN."
-                      404 -> "Не найдено (404). Проверьте адрес сервера и название модели."
+                      404 -> "Не найдено (404). Проверьте адрес сервера и название модели (можно очистить оба поля)."
                       429 -> "Слишком много запросов (429). Подождите."
                       else -> "Ошибка сервера ($code)."
                   }
@@ -1415,7 +1437,7 @@ jobs:
 
               /** Horrons AI: адрес сервера, ключ и модель */
               var aiUrl: String
-                  get() = sp.getString("aiUrl", "https://api.anthropic.com") ?: "https://api.anthropic.com"
+                  get() = sp.getString("aiUrl", "") ?: ""
                   set(v) { sp.edit().putString("aiUrl", v).apply() }
 
               var aiKey: String
@@ -1423,7 +1445,7 @@ jobs:
                   set(v) { sp.edit().putString("aiKey", v).apply() }
 
               var aiModel: String
-                  get() = sp.getString("aiModel", "claude-haiku-5-5") ?: "claude-haiku-5-5"
+                  get() = sp.getString("aiModel", "") ?: ""
                   set(v) { sp.edit().putString("aiModel", v).apply() }
 
               // ----- клавиши -----
@@ -1782,8 +1804,8 @@ jobs:
 
                   // 7. Horrons AI
                   root.addView(title("Horrons AI"))
-                  root.addView(note("Помощник в клавиатуре: исправляет текст, делает короче, вежливее или отвечает на вопрос. Встроенного бесплатного ИИ нет: нужен ключ API любого ИИ-сервиса. Текст из поля отправляется выбранному сервису. В полях паролей помощник отключён. Ключ хранится только на этом телефоне."))
-                  root.addView(note("Для Anthropic оставь адрес по умолчанию. Для других сервисов впиши их адрес вида https://…/v1 (формат OpenAI) и название модели. Если сервис недоступен в твоей стране, нужен VPN."))
+                  root.addView(note("Помощник в клавиатуре: исправляет текст, делает короче, вежливее или отвечает на вопрос. Встроенного бесплатного ИИ нет: нужен ключ API любого ИИ-сервиса, просто вставь его ниже. Текст из поля отправляется выбранному сервису. В полях паролей помощник отключён. Ключ хранится только на этом телефоне."))
+                  root.addView(note("Сервис определяется по ключу сам: Anthropic (sk-ant-…), OpenAI (sk-…), Google Gemini (AIza…), Groq (gsk_…), OpenRouter (sk-or-…), xAI (xai-…). Адрес и модель можно оставить пустыми. Для другого сервиса впиши его адрес вида https://…/v1 (формат OpenAI) и название модели. Если сервис недоступен в твоей стране, нужен VPN."))
                   fun edit(label: String, value: String, secret: Boolean, onChange: (String) -> Unit) {
                       root.addView(TextView(this).apply {
                           text = label
@@ -1804,9 +1826,9 @@ jobs:
                           })
                       })
                   }
-                  edit("Адрес сервера", p.aiUrl, false) { p.aiUrl = it }
+                  edit("Адрес сервера (пусто = по ключу)", p.aiUrl, false) { p.aiUrl = it }
                   edit("Ключ API", p.aiKey, true) { p.aiKey = it }
-                  edit("Модель", p.aiModel, false) { p.aiModel = it }
+                  edit("Модель (пусто = по ключу)", p.aiModel, false) { p.aiModel = it }
                   root.addView(note("Как пользоваться: напиши текст в любом поле, нажми «✨ Horrons AI» и выбери действие. «Спросить» отправит написанное как вопрос и заменит его ответом."))
               }
           }
