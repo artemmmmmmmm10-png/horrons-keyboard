@@ -217,6 +217,8 @@ jobs:
           cat > 'app/src/main/java/ru/horrons/keyboard/KeyboardService.kt' <<'HRN_EOF'
           package ru.horrons.keyboard
 
+          import android.content.ClipboardManager
+          import android.content.Context
           import android.inputmethodservice.InputMethodService
           import android.os.Handler
           import android.os.Looper
@@ -266,9 +268,41 @@ jobs:
                   "ask" to "Ты Horrons AI, помощник внутри клавиатуры. Ответь на запрос пользователя кратко и по делу, на языке запроса. Верни только готовый ответ, без вступлений."
               )
 
+              // ----- буфер обмена -----
+              private var clip: String? = null
+              private var clipDismissed: String? = null
+              private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+                  loadClip()
+                  clipDismissed = null
+                  kv?.invalidate()
+              }
+
+              private fun loadClip() {
+                  clip = try {
+                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      val d = cm.primaryClip
+                      if (d != null && d.itemCount > 0) d.getItemAt(0).coerceToText(this)?.toString()?.trim() else null
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
               override fun onCreate() {
                   super.onCreate()
                   prefs = Prefs(this)
+                  try {
+                      (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).addPrimaryClipChangedListener(clipListener)
+                  } catch (e: Exception) {
+                  }
+                  loadClip()
+              }
+
+              override fun onDestroy() {
+                  try {
+                      (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).removePrimaryClipChangedListener(clipListener)
+                  } catch (e: Exception) {
+                  }
+                  super.onDestroy()
               }
 
               override fun onEvaluateFullscreenMode(): Boolean = false
@@ -297,6 +331,7 @@ jobs:
                   symbols = numeric
                   page = 0
                   shift = 0
+                  loadClip()
 
                   // сбрасываем панель инструментов и устаревшие запросы
                   mode = 0
@@ -330,7 +365,10 @@ jobs:
 
               /** Строки раскладки для текущего состояния. */
               fun rows(): List<List<Key>> =
-                  Layouts.build(lang, symbols, page, shift > 0, prefs.numberRow, enterLabel)
+                  Layouts.build(
+                      lang, symbols, page, shift > 0, prefs.numberRow, enterLabel,
+                      prefs.globe, prefs.globeRight, prefs.commaKey
+                  )
 
               /** Автозаглавная буква в начале предложения. */
               private fun updateShift() {
@@ -347,7 +385,28 @@ jobs:
               }
 
               fun type(text: String) {
-                  currentInputConnection?.commitText(text, 1)
+                  val ic = currentInputConnection
+                  var done = false
+                  if (ic != null && !password && ic.getSelectedText(0).isNullOrEmpty()) {
+                      if (text == " " && prefs.dblSpace) {
+                          // два пробела подряд после слова → точка и пробел
+                          val b = ic.getTextBeforeCursor(2, 0)?.toString()
+                          if (b != null && b.length == 2 && b[1] == ' ' && (b[0].isLetterOrDigit() || b[0] == ')')) {
+                              ic.deleteSurroundingText(1, 0)
+                              ic.commitText(". ", 1)
+                              done = true
+                          }
+                      } else if (text == "-" && prefs.smartDash) {
+                          // два дефиса подряд → тире
+                          val b = ic.getTextBeforeCursor(2, 0)?.toString()
+                          if (b != null && b.endsWith("-") && !b.startsWith("-")) {
+                              ic.deleteSurroundingText(1, 0)
+                              ic.commitText("—", 1)
+                              done = true
+                          }
+                      }
+                  }
+                  if (!done) ic?.commitText(text, 1)
                   val before = shift
                   if (shift == 1) shift = 0
                   updateShift()
@@ -365,6 +424,33 @@ jobs:
                   val before = shift
                   updateShift()
                   if (before != shift) kv?.refresh()
+              }
+
+              /** Удаляет слово слева от курсора (или выделенный текст). */
+              fun deleteWord() {
+                  val ic = currentInputConnection ?: return
+                  val sel = ic.getSelectedText(0)
+                  if (sel != null && sel.isNotEmpty()) {
+                      ic.commitText("", 1)
+                  } else {
+                      val b = ic.getTextBeforeCursor(100, 0)?.toString() ?: ""
+                      if (b.isEmpty()) {
+                          sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+                      } else {
+                          var i = b.length
+                          while (i > 0 && b[i - 1].isWhitespace()) i--
+                          while (i > 0 && !b[i - 1].isWhitespace()) i--
+                          ic.deleteSurroundingText(maxOf(1, b.length - i), 0)
+                      }
+                  }
+                  val before = shift
+                  updateShift()
+                  if (before != shift) kv?.refresh()
+              }
+
+              /** Сдвигает курсор: -1 влево, 1 вправо. */
+              fun moveCursor(dir: Int) {
+                  sendDownUpKeyEvents(if (dir < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT)
               }
 
               fun enter() {
@@ -409,14 +495,17 @@ jobs:
                   kv?.refresh()
               }
 
-              fun nextLang() {
+              fun nextLang() = switchLang(1, true)
+
+              /** Переключает язык: dir 1 — следующий, -1 — предыдущий. */
+              fun switchLang(dir: Int, picker: Boolean = false) {
                   val langs = prefs.langs.ifEmpty { listOf("ru") }
                   if (langs.size <= 1) {
-                      showPicker()
+                      if (picker) showPicker()
                       return
                   }
-                  val i = langs.indexOf(lang)
-                  lang = langs[(i + 1) % langs.size]
+                  val i = langs.indexOf(lang).coerceAtLeast(0)
+                  lang = langs[((i + dir) % langs.size + langs.size) % langs.size]
                   symbols = false
                   page = 0
                   updateShift()
@@ -459,6 +548,11 @@ jobs:
                       else -> {
                           out.add(Chip("tr", "🌐 Перевод"))
                           out.add(Chip("ai", "✨ Horrons AI"))
+                          val cl = clip
+                          if (prefs.clipSuggest && !password && !cl.isNullOrBlank() && cl != clipDismissed) {
+                              val one = cl.replace('\n', ' ')
+                              out.add(Chip("clip", "📋 " + (if (one.length > 14) one.take(14) + "…" else one)))
+                          }
                       }
                   }
                   return out
@@ -494,6 +588,15 @@ jobs:
                           val i = l.indexOf(prefs.trDst)
                           prefs.trDst = l[(i + 1) % l.size]
                           kv?.invalidate()
+                      }
+                      "clip" -> {
+                          val t = clip
+                          if (!t.isNullOrEmpty()) {
+                              currentInputConnection?.commitText(t, 1)
+                              if (prefs.clipClose) clipDismissed = t
+                              updateShift()
+                              kv?.refresh()
+                          }
                       }
                       "go" -> doTranslate()
                       "fix", "short", "polite", "ask" -> doAi(id)
@@ -639,6 +742,17 @@ jobs:
               private var topChip: String? = null
               private var lastX = 0f
 
+              // пробел: 0 — обычное нажатие, 1 — режим курсора, 2 — свайп сменил язык
+              private var spaceMode = 0
+              private var spaceMoved = false
+              private var spaceX0 = 0f
+              private var spaceAnchor = 0f
+
+              // backspace: счётчик повторов и опорная точка свайпа
+              private var repN = 0
+              private var delAnchor = 0f
+              private var delSwiped = false
+
               private val density = resources.displayMetrics.density
               private fun dp(v: Float): Float = v * density
 
@@ -732,7 +846,7 @@ jobs:
               // ---------- отрисовка ----------
 
               override fun onDraw(c: Canvas) {
-                  val t = Themes.get(svc.prefs.theme)
+                  val t = svc.prefs.themeObj()
                   c.drawColor(t.bg)
 
                   // верхняя панель: кнопки инструментов и «скрыть»
@@ -871,10 +985,9 @@ jobs:
               private fun alt(k: Key): String? {
                   if (k.kind != Kind.CHAR || k.small) return null
                   val base = k.out.lowercase()
-                  if (svc.lang == "ru") {
-                      val sp = Layouts.longPress[base]
-                      if (sp != null) return if (k.out != base) sp.uppercase() else sp
-                  }
+                  val sp = Layouts.longPress[svc.lang]?.get(base)
+                  if (sp != null) return if (k.out != base) sp.uppercase() else sp
+                  if (k.out == "." && !svc.prefs.commaKey && !svc.symbols) return ","
                   if (!svc.prefs.numberRow && !svc.symbols) {
                       val i = Layouts.topRowIndex(svc.lang, base)
                       if (i >= 0) return "1234567890"[i].toString()
@@ -905,10 +1018,27 @@ jobs:
 
               private val repeatRun = object : Runnable {
                   override fun run() {
-                      if (pressed?.key?.kind == Kind.BACKSPACE) {
-                          svc.backspace()
-                          uiHandler.postDelayed(this, 50)
+                      if (pressed?.key?.kind == Kind.BACKSPACE && !delSwiped) {
+                          repN++
+                          if (svc.prefs.wordDel && repN > 12) {
+                              svc.deleteWord()
+                              uiHandler.postDelayed(this, 160)
+                          } else {
+                              svc.backspace()
+                              uiHandler.postDelayed(this, 50)
+                          }
                       }
+                  }
+              }
+
+              private val cursorRun = Runnable {
+                  val s = pressed
+                  if (s != null && s.key.kind == Kind.SPACE && spaceMode == 0) {
+                      spaceMode = 1
+                      spaceMoved = false
+                      spaceAnchor = lastX
+                      feedback()
+                      invalidate()
                   }
               }
 
@@ -971,11 +1101,20 @@ jobs:
                   pressed = s
                   feedback()
                   val k = s.key
+                  val ms = svc.prefs.longMs.toLong()
                   if (k.kind == Kind.BACKSPACE) {
                       svc.backspace()
+                      repN = 0
+                      delSwiped = false
+                      delAnchor = x
                       uiHandler.postDelayed(repeatRun, 400)
+                  } else if (k.kind == Kind.SPACE) {
+                      spaceMode = 0
+                      spaceMoved = false
+                      spaceX0 = x
+                      if (svc.prefs.spaceCursor) uiHandler.postDelayed(cursorRun, ms)
                   } else if (alt(k) != null || k.kind == Kind.LANG) {
-                      uiHandler.postDelayed(longRun, 380)
+                      uiHandler.postDelayed(longRun, ms)
                   }
                   invalidate()
               }
@@ -983,13 +1122,53 @@ jobs:
               private fun slide(x: Float, y: Float) {
                   lastX = x
                   val cur = pressed ?: return
-                  if (cur.key.kind == Kind.BACKSPACE) return
+                  if (cur.key.kind == Kind.BACKSPACE) {
+                      // свайп влево от backspace удаляет слова
+                      if (svc.prefs.swipeDel && !delSwiped && delAnchor - x > dp(40f)) {
+                          delSwiped = true
+                          uiHandler.removeCallbacks(repeatRun)
+                      }
+                      if (delSwiped) {
+                          while (delAnchor - x > dp(40f)) {
+                              svc.deleteWord()
+                              delAnchor -= dp(40f)
+                          }
+                          if (x > delAnchor) delAnchor = x
+                      }
+                      return
+                  }
+                  if (cur.key.kind == Kind.SPACE && spaceMode != 0) {
+                      if (spaceMode == 1) {
+                          val step = dp(14f)
+                          while (x - spaceAnchor > step) {
+                              svc.moveCursor(1)
+                              spaceAnchor += step
+                              spaceMoved = true
+                          }
+                          while (spaceAnchor - x > step) {
+                              svc.moveCursor(-1)
+                              spaceAnchor -= step
+                              spaceMoved = true
+                          }
+                      }
+                      return
+                  }
+                  if (cur.key.kind == Kind.SPACE && svc.prefs.spaceLang && Math.abs(x - spaceX0) > dp(70f)) {
+                      uiHandler.removeCallbacks(cursorRun)
+                      spaceMode = 2
+                      feedback()
+                      svc.switchLang(if (x > spaceX0) 1 else -1)
+                      invalidate()
+                      return
+                  }
                   val s = find(x, y) ?: return
                   if (s !== cur) {
                       uiHandler.removeCallbacks(longRun)
+                      uiHandler.removeCallbacks(cursorRun)
                       longFired = false
                       pressed = s
-                      if (alt(s.key) != null) uiHandler.postDelayed(longRun, 380)
+                      val ms = svc.prefs.longMs.toLong()
+                      if (alt(s.key) != null) uiHandler.postDelayed(longRun, ms)
                       invalidate()
                   }
               }
@@ -997,6 +1176,7 @@ jobs:
               private fun release(commit: Boolean) {
                   uiHandler.removeCallbacks(longRun)
                   uiHandler.removeCallbacks(repeatRun)
+                  uiHandler.removeCallbacks(cursorRun)
                   val s = pressed
                   pressed = null
                   if (topTap) {
@@ -1010,7 +1190,11 @@ jobs:
                       invalidate()
                       return
                   }
-                  if (commit && s != null && !longFired && s.key.kind != Kind.BACKSPACE) act(s.key)
+                  val spaceSkip = s != null && s.key.kind == Kind.SPACE &&
+                          (spaceMode == 2 || (spaceMode == 1 && spaceMoved))
+                  if (commit && s != null && !longFired && s.key.kind != Kind.BACKSPACE && !spaceSkip) act(s.key)
+                  spaceMode = 0
+                  spaceMoved = false
                   longFired = false
                   invalidate()
               }
@@ -1061,16 +1245,38 @@ jobs:
           )
 
           object Layouts {
-              val names = mapOf("ru" to "Русский", "en" to "English", "uk" to "Українська")
+              val names = mapOf(
+                  "ru" to "Русский", "en" to "English", "uk" to "Українська",
+                  "de" to "Deutsch", "fr" to "Français", "es" to "Español", "it" to "Italiano",
+                  "pt" to "Português", "pl" to "Polski", "tr" to "Türkçe"
+              )
+
+              /** Все доступные раскладки */
+              val all = listOf("ru", "en", "uk", "de", "fr", "es", "it", "pt", "pl", "tr")
 
               val letters = mapOf(
                   "ru" to listOf("йцукенгшщзхъ", "фывапролджэ", "ячсмитьбю"),
                   "en" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
-                  "uk" to listOf("йцукенгшщзхї", "фівапролджє", "ячсмитьбюґ")
+                  "uk" to listOf("йцукенгшщзхї", "фівапролджє", "ячсмитьбюґ"),
+                  "de" to listOf("qwertzuiop", "asdfghjkl", "yxcvbnm"),
+                  "fr" to listOf("azertyuiop", "qsdfghjklm", "wxcvbn"),
+                  "es" to listOf("qwertyuiop", "asdfghjklñ", "zxcvbnm"),
+                  "it" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
+                  "pt" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
+                  "pl" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
+                  "tr" to listOf("ertyuıopğü", "asdfghjklşi", "zcvbnmöç")
               )
 
-              /** Что вводится долгим нажатием (только для русской раскладки) */
-              val longPress = mapOf("е" to "ё")
+              /** Что вводится долгим нажатием: язык → (буква → вариант) */
+              val longPress: Map<String, Map<String, String>> = mapOf(
+                  "ru" to mapOf("е" to "ё"),
+                  "de" to mapOf("a" to "ä", "o" to "ö", "u" to "ü", "s" to "ß"),
+                  "fr" to mapOf("e" to "é", "a" to "à", "u" to "ù", "c" to "ç", "i" to "î", "o" to "ô"),
+                  "es" to mapOf("a" to "á", "e" to "é", "i" to "í", "o" to "ó", "u" to "ú"),
+                  "it" to mapOf("e" to "è", "a" to "à", "o" to "ò", "u" to "ù", "i" to "ì"),
+                  "pt" to mapOf("a" to "ã", "e" to "é", "c" to "ç", "o" to "õ", "i" to "í"),
+                  "pl" to mapOf("a" to "ą", "c" to "ć", "e" to "ę", "l" to "ł", "n" to "ń", "o" to "ó", "s" to "ś", "z" to "ż")
+              )
 
               /** Позиция буквы в верхнем ряду (0..9) для цифр долгим нажатием, или -1 */
               fun topRowIndex(lang: String, ch: String): Int {
@@ -1085,7 +1291,10 @@ jobs:
                   page: Int,
                   shift: Boolean,
                   numRow: Boolean,
-                  enter: String
+                  enter: String,
+                  globe: Boolean = true,
+                  globeRight: Boolean = false,
+                  comma: Boolean = true
               ): List<List<Key>> {
                   val rows = ArrayList<List<Key>>()
 
@@ -1093,7 +1302,14 @@ jobs:
                       s.map { Key(it.toString(), small = small) }
 
                   fun cased(s: String): List<Key> =
-                      s.map { Key(if (shift) it.toString().uppercase() else it.toString()) }
+                      s.map {
+                          val ch = it.toString()
+                          Key(
+                              if (!shift) ch
+                              else if (lang == "tr") ch.uppercase(java.util.Locale("tr"))
+                              else ch.uppercase()
+                          )
+                      }
 
                   fun pad(keys: List<Key>): List<Key> {
                       val n = keys.size
@@ -1121,17 +1337,17 @@ jobs:
                   }
 
                   val langName = names[lang] ?: lang
-                  val symLabel = if (sym) (if (lang == "en") "ABC" else "АБВ") else "?123"
-                  rows.add(
-                      listOf(
-                          Key(symLabel, "", Kind.SYMBOLS, 1.4f),
-                          Key(","),
-                          Key("🌐", "", Kind.LANG, 1f),
-                          Key(langName, " ", Kind.SPACE, 4f),
-                          Key("."),
-                          Key(enter, "", Kind.ENTER, 1.4f)
-                      )
-                  )
+                  val cyr = lang == "ru" || lang == "uk"
+                  val symLabel = if (sym) (if (cyr) "АБВ" else "ABC") else "?123"
+                  val bottom = ArrayList<Key>()
+                  bottom.add(Key(symLabel, "", Kind.SYMBOLS, 1.4f))
+                  if (globe && !globeRight) bottom.add(Key("🌐", "", Kind.LANG, 1f))
+                  if (comma) bottom.add(Key(","))
+                  bottom.add(Key(langName, " ", Kind.SPACE, if (comma) 4f else 5f))
+                  if (globe && globeRight) bottom.add(Key("🌐", "", Kind.LANG, 1f))
+                  bottom.add(Key("."))
+                  bottom.add(Key(enter, "", Kind.ENTER, 1.4f))
+                  rows.add(bottom)
                   return rows
               }
           }
@@ -1209,6 +1425,69 @@ jobs:
               var aiModel: String
                   get() = sp.getString("aiModel", "claude-haiku-5-5") ?: "claude-haiku-5-5"
                   set(v) { sp.edit().putString("aiModel", v).apply() }
+
+              // ----- клавиши -----
+              var spaceCursor: Boolean
+                  get() = sp.getBoolean("spaceCursor", true)
+                  set(v) { sp.edit().putBoolean("spaceCursor", v).apply() }
+
+              var spaceLang: Boolean
+                  get() = sp.getBoolean("spaceLang", true)
+                  set(v) { sp.edit().putBoolean("spaceLang", v).apply() }
+
+              var globe: Boolean
+                  get() = sp.getBoolean("globe", true)
+                  set(v) { sp.edit().putBoolean("globe", v).apply() }
+
+              var globeRight: Boolean
+                  get() = sp.getBoolean("globeRight", false)
+                  set(v) { sp.edit().putBoolean("globeRight", v).apply() }
+
+              var commaKey: Boolean
+                  get() = sp.getBoolean("commaKey", true)
+                  set(v) { sp.edit().putBoolean("commaKey", v).apply() }
+
+              /** Длительность долгого нажатия, мс: 200..600 */
+              var longMs: Int
+                  get() = sp.getInt("longMs", 300)
+                  set(v) { sp.edit().putInt("longMs", v).apply() }
+
+              // ----- ввод текста -----
+              var dblSpace: Boolean
+                  get() = sp.getBoolean("dblSpace", true)
+                  set(v) { sp.edit().putBoolean("dblSpace", v).apply() }
+
+              var smartDash: Boolean
+                  get() = sp.getBoolean("smartDash", true)
+                  set(v) { sp.edit().putBoolean("smartDash", v).apply() }
+
+              var wordDel: Boolean
+                  get() = sp.getBoolean("wordDel", true)
+                  set(v) { sp.edit().putBoolean("wordDel", v).apply() }
+
+              var swipeDel: Boolean
+                  get() = sp.getBoolean("swipeDel", true)
+                  set(v) { sp.edit().putBoolean("swipeDel", v).apply() }
+
+              var clipSuggest: Boolean
+                  get() = sp.getBoolean("clipSuggest", true)
+                  set(v) { sp.edit().putBoolean("clipSuggest", v).apply() }
+
+              var clipClose: Boolean
+                  get() = sp.getBoolean("clipClose", true)
+                  set(v) { sp.edit().putBoolean("clipClose", v).apply() }
+
+              // ----- своя тема -----
+              var customBg: String
+                  get() = sp.getString("customBg", "#202A44") ?: "#202A44"
+                  set(v) { sp.edit().putString("customBg", v).apply() }
+
+              var customAccent: String
+                  get() = sp.getString("customAccent", "#FF8A3D") ?: "#FF8A3D"
+                  set(v) { sp.edit().putString("customAccent", v).apply() }
+
+              fun themeObj(): KbTheme =
+                  if (theme == Themes.all.size) Themes.custom(customBg, customAccent) else Themes.get(theme)
           }
           HRN_EOF
           mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/SettingsActivity.kt')"
@@ -1223,6 +1502,7 @@ jobs:
           import android.text.Editable
           import android.text.InputType
           import android.text.TextWatcher
+          import android.view.Gravity
           import android.view.View
           import android.view.inputmethod.InputMethodManager
           import android.widget.AdapterView
@@ -1297,15 +1577,38 @@ jobs:
                   // 2. Темы
                   root.addView(title("Тема"))
                   val group = RadioGroup(this)
-                  Themes.all.forEachIndexed { i, t ->
+                  val themeNames = Themes.all.map { it.name } + "Своя (задай цвета ниже)"
+                  themeNames.forEachIndexed { i, n ->
                       group.addView(RadioButton(this).apply {
                           id = View.generateViewId()
-                          text = t.name
+                          text = n
                           isChecked = i == p.theme
                           setOnClickListener { p.theme = i }
                       })
                   }
                   root.addView(group)
+                  fun hexField(label: String, value: String, onChange: (String) -> Unit) {
+                      root.addView(TextView(this).apply {
+                          text = label
+                          setPadding(0, 8.dp(), 0, 0)
+                      })
+                      root.addView(EditText(this).apply {
+                          setText(value)
+                          inputType = InputType.TYPE_CLASS_TEXT
+                          setSingleLine()
+                          addTextChangedListener(object : TextWatcher {
+                              override fun afterTextChanged(s: Editable?) {
+                                  onChange(s?.toString()?.trim() ?: "")
+                              }
+
+                              override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                              override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                          })
+                      })
+                  }
+                  root.addView(note("Своя тема: впиши цвета в формате #RRGGBB, например #202A44. Остальные оттенки подберутся сами."))
+                  hexField("Цвет фона", p.customBg) { p.customBg = it }
+                  hexField("Цвет акцента (кнопка ввода, выделение)", p.customAccent) { p.customAccent = it }
 
                   // 3. Высота
                   val heightLabel = TextView(this)
@@ -1331,27 +1634,78 @@ jobs:
 
                   // 4. Языки
                   root.addView(title("Языки"))
-                  val order = listOf("ru", "en", "uk")
-                  val boxes = ArrayList<CheckBox>()
-                  order.forEach { code ->
-                      val cb = CheckBox(this).apply {
-                          text = Layouts.names[code]
-                          isChecked = code in p.langs
-                      }
-                      boxes.add(cb)
-                      root.addView(cb)
+                  root.addView(note("Отметь нужные языки. Стрелки ↑ ↓ меняют порядок переключения."))
+                  val search = EditText(this).apply {
+                      hint = "Поиск языков"
+                      setSingleLine()
                   }
-                  boxes.forEach { cb ->
-                      cb.setOnCheckedChangeListener { _, _ ->
-                          val chosen = order.filterIndexed { i, _ -> boxes[i].isChecked }
-                          if (chosen.isEmpty()) {
-                              // хотя бы один язык должен остаться
-                              cb.isChecked = true
-                          } else {
-                              p.langs = chosen
+                  val langBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                  fun renderLangs() {
+                      langBox.removeAllViews()
+                      val q = search.text.toString().trim().lowercase()
+                      val chosen = p.langs.filter { it in Layouts.all }
+                      val ordered = chosen + Layouts.all.filter { it !in chosen }
+                      for (code in ordered) {
+                          val name = Layouts.names[code] ?: code
+                          if (q.isNotEmpty() && !name.lowercase().contains(q)) continue
+                          val row = LinearLayout(this).apply {
+                              orientation = LinearLayout.HORIZONTAL
+                              gravity = Gravity.CENTER_VERTICAL
                           }
+                          val cb = CheckBox(this).apply {
+                              text = name
+                              isChecked = code in chosen
+                          }
+                          row.addView(cb, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                          cb.setOnCheckedChangeListener { _, on ->
+                              val cur = p.langs.filter { it in Layouts.all }.toMutableList()
+                              if (on) {
+                                  if (code !in cur) cur.add(code)
+                              } else {
+                                  cur.remove(code)
+                              }
+                              if (cur.isEmpty()) cur.add(code)
+                              p.langs = cur
+                              renderLangs()
+                          }
+                          if (code in chosen) {
+                              fun arrow(sym: String, d: Int) {
+                                  row.addView(TextView(this).apply {
+                                      text = sym
+                                      textSize = 22f
+                                      setPadding(14.dp(), 6.dp(), 14.dp(), 6.dp())
+                                      setOnClickListener {
+                                          val cur = p.langs.filter { it in Layouts.all }.toMutableList()
+                                          val i = cur.indexOf(code)
+                                          val j = i + d
+                                          if (i >= 0 && j in 0 until cur.size) {
+                                              val tmp = cur[i]
+                                              cur[i] = cur[j]
+                                              cur[j] = tmp
+                                              p.langs = cur
+                                              renderLangs()
+                                          }
+                                      }
+                                  })
+                              }
+                              arrow("↑", -1)
+                              arrow("↓", 1)
+                          }
+                          langBox.addView(row)
                       }
                   }
+                  search.addTextChangedListener(object : TextWatcher {
+                      override fun afterTextChanged(s: Editable?) {
+                          renderLangs()
+                      }
+
+                      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                  })
+                  root.addView(search)
+                  root.addView(langBox)
+                  renderLangs()
 
                   // 5. Переключатели
                   root.addView(title("Поведение"))
@@ -1368,6 +1722,45 @@ jobs:
                   sw("Вибрация при нажатии", { p.vibrate }, { p.vibrate = it })
                   sw("Звук при нажатии", { p.sound }, { p.sound = it })
                   sw("Заглавная в начале предложения", { p.autoCap }, { p.autoCap = it })
+
+                  // 5a. Клавиши
+                  root.addView(title("Клавиши"))
+                  sw("Управление курсором (зажми пробел и води пальцем)", { p.spaceCursor }, { p.spaceCursor = it })
+                  sw("Смена языка свайпом по пробелу", { p.spaceLang }, { p.spaceLang = it })
+                  sw("Кнопка смены языка (глобус)", { p.globe }, { p.globe = it })
+                  sw("Глобус справа от пробела", { p.globeRight }, { p.globeRight = it })
+                  sw("Запятая на отдельной клавише (иначе: долгое нажатие на точку)", { p.commaKey }, { p.commaKey = it })
+                  val msLabel = TextView(this)
+                  fun updMs() {
+                      msLabel.text = "Длительность долгого нажатия: ${p.longMs} мс"
+                  }
+                  updMs()
+                  root.addView(msLabel)
+                  root.addView(SeekBar(this).apply {
+                      max = 400
+                      progress = (p.longMs - 200).coerceIn(0, 400)
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(sb: SeekBar, value: Int, fromUser: Boolean) {
+                              p.longMs = 200 + value
+                              updMs()
+                          }
+
+                          override fun onStartTrackingTouch(sb: SeekBar) {}
+                          override fun onStopTrackingTouch(sb: SeekBar) {}
+                      })
+                  })
+
+                  // 5b. Ввод текста
+                  root.addView(title("Ввод текста"))
+                  sw("Точка по двойному пробелу", { p.dblSpace }, { p.dblSpace = it })
+                  sw("Умное тире (два дефиса → —)", { p.smartDash }, { p.smartDash = it })
+                  sw("Пословное удаление (при зажатом backspace)", { p.wordDel }, { p.wordDel = it })
+                  sw("Удаление жестом (свайп влево от backspace)", { p.swipeDel }, { p.swipeDel = it })
+
+                  // 5c. Верхняя панель
+                  root.addView(title("Верхняя панель"))
+                  sw("Подсказка из буфера обмена", { p.clipSuggest }, { p.clipSuggest = it })
+                  sw("Прятать подсказку после вставки", { p.clipClose }, { p.clipClose = it })
 
                   // 6. Переводчик
                   root.addView(title("Переводчик"))
@@ -1446,8 +1839,42 @@ jobs:
                   KbTheme("Ночь (AMOLED)", c("#000000"), c("#1A1A1A"), c("#0F0F0F"), c("#FFFFFF"), c("#777777"), c("#3DDC84"), c("#001A0A"), c("#333333"), c("#2A2A2A")),
                   KbTheme("Синяя", c("#0F1B33"), c("#22355C"), c("#18284A"), c("#EAF1FF"), c("#8FA6D6"), c("#4A8AFF"), c("#FFFFFF"), c("#3A5188"), c("#3A5188")),
                   KbTheme("Зелёная", c("#0E2217"), c("#1E4430"), c("#143222"), c("#E8FFF1"), c("#8FC9A6"), c("#3DDC84"), c("#04210F"), c("#2F6A4A"), c("#2F6A4A")),
-                  KbTheme("Рогатый (красная)", c("#1A0808"), c("#3A1412"), c("#2A0D0C"), c("#FFE9E6"), c("#C98F89"), c("#E5484D"), c("#FFFFFF"), c("#6A2622"), c("#6A2622"))
+                  KbTheme("Рогатый (красная)", c("#1A0808"), c("#3A1412"), c("#2A0D0C"), c("#FFE9E6"), c("#C98F89"), c("#E5484D"), c("#FFFFFF"), c("#6A2622"), c("#6A2622")),
+                  KbTheme("Фиолетовая", c("#1B1030"), c("#33215C"), c("#251645"), c("#F1EAFF"), c("#A996D6"), c("#9B6BFF"), c("#FFFFFF"), c("#4D3688"), c("#4D3688")),
+                  KbTheme("Розовая", c("#2A0F1E"), c("#4F1D38"), c("#3A1429"), c("#FFE8F3"), c("#D69AB8"), c("#FF5FA2"), c("#FFFFFF"), c("#7A2D55"), c("#7A2D55")),
+                  KbTheme("Золотая", c("#1F1A0E"), c("#3D3418"), c("#2D2610"), c("#FFF6D6"), c("#C9B26B"), c("#F5B700"), c("#1F1600"), c("#5E5026"), c("#5E5026")),
+                  KbTheme("Серая", c("#2B2D31"), c("#44474D"), c("#35373C"), c("#F2F3F5"), c("#9A9DA5"), c("#7FB2FF"), c("#0B1A33"), c("#5C6068"), c("#5C6068"))
               )
+
+              private fun parse(s: String, def: Int): Int = try {
+                  Color.parseColor(s.trim().let { if (it.startsWith("#")) it else "#$it" })
+              } catch (e: Exception) {
+                  def
+              }
+
+              private fun mix(a: Int, b: Int, t: Float): Int {
+                  val r = (Color.red(a) + (Color.red(b) - Color.red(a)) * t).toInt()
+                  val g = (Color.green(a) + (Color.green(b) - Color.green(a)) * t).toInt()
+                  val bl = (Color.blue(a) + (Color.blue(b) - Color.blue(a)) * t).toInt()
+                  return Color.rgb(r, g, bl)
+              }
+
+              private fun lum(x: Int): Float = (0.299f * Color.red(x) + 0.587f * Color.green(x) + 0.114f * Color.blue(x)) / 255f
+
+              /** Своя тема: из двух цветов (фон и акцент) выводятся остальные. */
+              fun custom(bgHex: String, accentHex: String): KbTheme {
+                  val bg = parse(bgHex, c("#202A44"))
+                  val ac = parse(accentHex, c("#FF8A3D"))
+                  val dark = lum(bg) < 0.5f
+                  val text = if (dark) c("#F2F2F4") else c("#1B1B1F")
+                  val key = if (dark) mix(bg, Color.WHITE, 0.14f) else mix(bg, Color.WHITE, 0.7f)
+                  val special = if (dark) mix(bg, Color.WHITE, 0.06f) else mix(bg, Color.BLACK, 0.1f)
+                  val pressed = mix(key, text, 0.2f)
+                  return KbTheme(
+                      "Своя", bg, key, special, text, mix(bg, text, 0.55f), ac,
+                      if (lum(ac) > 0.55f) c("#1B1B1F") else Color.WHITE, pressed, pressed
+                  )
+              }
 
               fun get(i: Int): KbTheme = all[i.coerceIn(0, all.lastIndex)]
           }
