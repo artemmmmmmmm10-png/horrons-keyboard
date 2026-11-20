@@ -129,7 +129,7 @@ jobs:
                       key.startsWith("sk-ant-") -> Svc("https://api.anthropic.com", "claude-haiku-5-5")
                       key.startsWith("sk-or-") -> Svc("https://openrouter.ai/api/v1", "openai/gpt-4o-mini")
                       key.startsWith("gsk_") -> Svc("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile")
-                      key.startsWith("AIza") -> Svc("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-latest")
+                      key.startsWith("AIza") || key.startsWith("AQ.") -> Svc("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-latest")
                       key.startsWith("xai-") -> Svc("https://api.x.ai/v1", "grok-3-mini")
                       key.startsWith("sk-") -> Svc("https://api.openai.com/v1", "gpt-4o-mini")
                       else -> Svc("https://api.openai.com/v1", "gpt-4o-mini")
@@ -1805,7 +1805,7 @@ jobs:
                   // 7. Horrons AI
                   root.addView(title("Horrons AI"))
                   root.addView(note("Помощник в клавиатуре: исправляет текст, делает короче, вежливее или отвечает на вопрос. Встроенного бесплатного ИИ нет: нужен ключ API любого ИИ-сервиса, просто вставь его ниже. Текст из поля отправляется выбранному сервису. В полях паролей помощник отключён. Ключ хранится только на этом телефоне."))
-                  root.addView(note("Сервис определяется по ключу сам: Anthropic (sk-ant-…), OpenAI (sk-…), Google Gemini (AIza…), Groq (gsk_…), OpenRouter (sk-or-…), xAI (xai-…). Адрес и модель можно оставить пустыми. Для другого сервиса впиши его адрес вида https://…/v1 (формат OpenAI) и название модели. Если сервис недоступен в твоей стране, нужен VPN."))
+                  root.addView(note("Сервис определяется по ключу сам: Anthropic (sk-ant-…), OpenAI (sk-…), Google Gemini (AIza… или AQ.…), Groq (gsk_…), OpenRouter (sk-or-…), xAI (xai-…). Адрес и модель можно оставить пустыми. Для другого сервиса впиши его адрес вида https://…/v1 (формат OpenAI) и название модели. Если сервис недоступен в твоей стране, нужен VPN."))
                   fun edit(label: String, value: String, secret: Boolean, onChange: (String) -> Unit) {
                       root.addView(TextView(this).apply {
                           text = label
