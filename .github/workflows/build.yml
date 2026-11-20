@@ -60,11 +60,17 @@ jobs:
                   jvmTarget = "17"
               }
           }
+
+          dependencies {
+              implementation("com.google.mlkit:translate:17.0.3")
+          }
           HRN_EOF
           mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
           cat > 'app/src/main/AndroidManifest.xml' <<'HRN_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
 
               <application
                   android:allowBackup="true"
@@ -96,11 +102,124 @@ jobs:
               </application>
           </manifest>
           HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Ai.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Ai.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.os.Handler
+          import android.os.Looper
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /**
+           * Запрос к ИИ. Если адрес содержит anthropic.com, используется формат Anthropic Messages,
+           * иначе формат OpenAI (адрес + /chat/completions), который понимают многие сервисы.
+           */
+          object Ai {
+              private val main = Handler(Looper.getMainLooper())
+
+              /** Колбэк вызывается в главном потоке: (ответ, ошибка). */
+              fun ask(
+                  baseUrl: String,
+                  key: String,
+                  model: String,
+                  system: String,
+                  user: String,
+                  cb: (String?, String?) -> Unit
+              ) {
+                  Thread {
+                      var res: String? = null
+                      var err: String? = null
+                      try {
+                          val base = baseUrl.trim().trimEnd('/')
+                          val anthropic = base.contains("anthropic.com")
+                          val url = URL(if (anthropic) "$base/v1/messages" else "$base/chat/completions")
+                          val c = url.openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"
+                          c.connectTimeout = 15000
+                          c.readTimeout = 60000
+                          c.doOutput = true
+                          c.setRequestProperty("Content-Type", "application/json")
+
+                          val body = JSONObject()
+                          body.put("model", model.trim())
+                          body.put("max_tokens", 1024)
+                          if (anthropic) {
+                              c.setRequestProperty("x-api-key", key.trim())
+                              c.setRequestProperty("anthropic-version", "2023-06-01")
+                              body.put("system", system)
+                              body.put(
+                                  "messages",
+                                  JSONArray().put(JSONObject().put("role", "user").put("content", user))
+                              )
+                          } else {
+                              c.setRequestProperty("Authorization", "Bearer " + key.trim())
+                              body.put(
+                                  "messages",
+                                  JSONArray()
+                                      .put(JSONObject().put("role", "system").put("content", system))
+                                      .put(JSONObject().put("role", "user").put("content", user))
+                              )
+                          }
+                          c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+                          val code = c.responseCode
+                          val stream = if (code in 200..299) c.inputStream else c.errorStream
+                          val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                          if (code in 200..299) {
+                              val j = JSONObject(text)
+                              val out: String
+                              if (anthropic) {
+                                  val arr = j.getJSONArray("content")
+                                  val sb = StringBuilder()
+                                  for (i in 0 until arr.length()) {
+                                      val b = arr.getJSONObject(i)
+                                      if (b.optString("type") == "text") sb.append(b.optString("text"))
+                                  }
+                                  out = sb.toString().trim()
+                              } else {
+                                  out = j.getJSONArray("choices").getJSONObject(0)
+                                      .getJSONObject("message").getString("content").trim()
+                              }
+                              if (out.isEmpty()) err = "Пустой ответ" else res = out
+                          } else {
+                              err = explain(code, text)
+                          }
+                      } catch (e: Exception) {
+                          err = "Нет связи с сервером"
+                      }
+                      val fr = res
+                      val fe = err
+                      main.post { cb(fr, fe) }
+                  }.start()
+              }
+
+              private fun explain(code: Int, body: String): String {
+                  var msg = ""
+                  try {
+                      msg = JSONObject(body).optJSONObject("error")?.optString("message") ?: ""
+                  } catch (e: Exception) {
+                  }
+                  val base = when (code) {
+                      401 -> "Ключ не подошёл (401)."
+                      403 -> "Доступ закрыт (403). Возможно, сервис недоступен в вашей стране: нужен VPN."
+                      404 -> "Не найдено (404). Проверьте адрес сервера и название модели."
+                      429 -> "Слишком много запросов (429). Подождите."
+                      else -> "Ошибка сервера ($code)."
+                  }
+                  return if (msg.isNotEmpty()) base + " " + msg.take(80) else base
+              }
+          }
+          HRN_EOF
           mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/KeyboardService.kt')"
           cat > 'app/src/main/java/ru/horrons/keyboard/KeyboardService.kt' <<'HRN_EOF'
           package ru.horrons.keyboard
 
           import android.inputmethodservice.InputMethodService
+          import android.os.Handler
+          import android.os.Looper
           import android.os.SystemClock
           import android.text.InputType
           import android.view.KeyEvent
@@ -123,6 +242,29 @@ jobs:
 
               private var enterLabel = "↵"
               private var password = false
+
+              // ----- панель инструментов: перевод и Horrons AI -----
+              /** 0 — клавиатура, 1 — перевод, 2 — Horrons AI */
+              var mode: Int = 0
+              var status: String? = null
+              var statusErr: Boolean = false
+              var busy: Boolean = false
+              private var token = 0
+              private var undoText: String? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private val clearRun = Runnable {
+                  status = null
+                  kv?.invalidate()
+              }
+
+              private val srcList = listOf("auto", "en", "ru", "uk", "de", "es", "fr", "it", "pt", "tr", "zh", "ja", "ko")
+
+              private val sys = mapOf(
+                  "fix" to "Ты Horrons AI. Исправь орфографию, пунктуацию и грамматику в тексте пользователя. Сохрани смысл, язык и стиль. Верни только исправленный текст, без пояснений и кавычек.",
+                  "short" to "Ты Horrons AI. Сделай текст пользователя короче, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "polite" to "Ты Horrons AI. Перепиши текст пользователя вежливее и аккуратнее, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "ask" to "Ты Horrons AI, помощник внутри клавиатуры. Ответь на запрос пользователя кратко и по делу, на языке запроса. Верни только готовый ответ, без вступлений."
+              )
 
               override fun onCreate() {
                   super.onCreate()
@@ -155,6 +297,14 @@ jobs:
                   symbols = numeric
                   page = 0
                   shift = 0
+
+                  // сбрасываем панель инструментов и устаревшие запросы
+                  mode = 0
+                  token++
+                  busy = false
+                  undoText = null
+                  ui.removeCallbacks(clearRun)
+                  status = null
 
                   enterLabel = when (info.imeOptions and EditorInfo.IME_MASK_ACTION) {
                       EditorInfo.IME_ACTION_SEARCH -> "🔍"
@@ -277,6 +427,175 @@ jobs:
                   val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
                   imm.showInputMethodPicker()
               }
+
+              // ================= панель инструментов =================
+
+              /** Кнопки верхней панели в текущем режиме. */
+              fun toolbar(): List<Chip> {
+                  val st = status
+                  if (st != null) {
+                      return listOf(
+                          Chip("", st, if (statusErr) 3 else 2),
+                          Chip("clear", if (busy) "✕" else "OK")
+                      )
+                  }
+                  val out = ArrayList<Chip>()
+                  when (mode) {
+                      1 -> {
+                          out.add(Chip("src", if (prefs.trSrc == "auto") "Авто" else prefs.trSrc.uppercase()))
+                          out.add(Chip("dst", "→ " + prefs.trDst.uppercase()))
+                          out.add(Chip("go", "Перевести", 1))
+                          if (undoText != null) out.add(Chip("undo", "↩"))
+                          out.add(Chip("close", "✕"))
+                      }
+                      2 -> {
+                          out.add(Chip("fix", "Исправить"))
+                          out.add(Chip("short", "Короче"))
+                          out.add(Chip("polite", "Вежливо"))
+                          out.add(Chip("ask", "Спросить", 1))
+                          if (undoText != null) out.add(Chip("undo", "↩"))
+                          out.add(Chip("close", "✕"))
+                      }
+                      else -> {
+                          out.add(Chip("tr", "🌐 Перевод"))
+                          out.add(Chip("ai", "✨ Horrons AI"))
+                      }
+                  }
+                  return out
+              }
+
+              fun onTool(id: String) {
+                  if (busy && id != "clear") return
+                  when (id) {
+                      "tr" -> {
+                          mode = 1
+                          kv?.invalidate()
+                      }
+                      "ai" -> {
+                          mode = 2
+                          kv?.invalidate()
+                      }
+                      "close" -> {
+                          mode = 0
+                          setStatus(null)
+                      }
+                      "clear" -> {
+                          token++
+                          busy = false
+                          setStatus(null)
+                      }
+                      "src" -> {
+                          val i = srcList.indexOf(prefs.trSrc)
+                          prefs.trSrc = srcList[(i + 1) % srcList.size]
+                          kv?.invalidate()
+                      }
+                      "dst" -> {
+                          val l = srcList.drop(1)
+                          val i = l.indexOf(prefs.trDst)
+                          prefs.trDst = l[(i + 1) % l.size]
+                          kv?.invalidate()
+                      }
+                      "go" -> doTranslate()
+                      "fix", "short", "polite", "ask" -> doAi(id)
+                      "undo" -> doUndo()
+                  }
+              }
+
+              private fun setStatus(msg: String?, err: Boolean = false, ms: Long = 2500) {
+                  status = msg
+                  statusErr = err
+                  ui.removeCallbacks(clearRun)
+                  if (msg != null && !busy && ms > 0) ui.postDelayed(clearRun, ms)
+                  kv?.invalidate()
+              }
+
+              private class Job(val orig: String, val sel: Boolean, val before: Int, val after: Int)
+
+              /** Текст для обработки: выделенный или весь текст поля вокруг курсора. */
+              private fun readField(): Job? {
+                  val ic = currentInputConnection ?: return null
+                  val sel = ic.getSelectedText(0)
+                  if (sel != null && sel.isNotEmpty()) return Job(sel.toString(), true, 0, 0)
+                  val b = ic.getTextBeforeCursor(3000, 0)?.toString() ?: ""
+                  val a = ic.getTextAfterCursor(3000, 0)?.toString() ?: ""
+                  val all = b + a
+                  return if (all.isBlank()) null else Job(all, false, b.length, a.length)
+              }
+
+              /** Заменяет исходный текст результатом. false, если за время ожидания текст изменился. */
+              private fun applyJob(job: Job, result: String): Boolean {
+                  val ic = currentInputConnection ?: return false
+                  val now = readField()
+                  if (now == null || now.orig != job.orig) return false
+                  if (!job.sel) ic.deleteSurroundingText(job.before, job.after)
+                  ic.commitText(result, 1)
+                  undoText = job.orig
+                  return true
+              }
+
+              private fun doUndo() {
+                  val u = undoText ?: return
+                  val ic = currentInputConnection ?: return
+                  val job = readField()
+                  if (job != null && !job.sel) ic.deleteSurroundingText(job.before, job.after)
+                  ic.commitText(u, 1)
+                  undoText = null
+                  setStatus("Возвращено", false, 1500)
+              }
+
+              private fun doTranslate() {
+                  if (password) {
+                      setStatus("В полях пароля перевод отключён", true)
+                      return
+                  }
+                  val job = readField() ?: run {
+                      setStatus("Сначала напишите текст в поле", true)
+                      return
+                  }
+                  busy = true
+                  val my = ++token
+                  setStatus("Перевожу…", false)
+                  Tr.translate(job.orig, prefs.trSrc, prefs.trDst) { res, err ->
+                      if (my == token) {
+                          busy = false
+                          if (res != null) {
+                              if (applyJob(job, res)) setStatus("Готово", false, 1200)
+                              else setStatus("Текст изменился, повторите", true)
+                          } else {
+                              setStatus(err ?: "Ошибка перевода", true, 5000)
+                          }
+                      }
+                  }
+              }
+
+              private fun doAi(kind: String) {
+                  if (password) {
+                      setStatus("В полях пароля помощник отключён", true)
+                      return
+                  }
+                  if (prefs.aiKey.isBlank()) {
+                      setStatus("Нужен ключ API. Откройте приложение Horrons Клавиатура, раздел Horrons AI.", true, 6000)
+                      return
+                  }
+                  val job = readField() ?: run {
+                      setStatus("Сначала напишите текст в поле", true)
+                      return
+                  }
+                  busy = true
+                  val my = ++token
+                  setStatus("Horrons AI думает…", false)
+                  Ai.ask(prefs.aiUrl, prefs.aiKey, prefs.aiModel, sys.getValue(kind), job.orig) { res, err ->
+                      if (my == token) {
+                          busy = false
+                          if (res != null) {
+                              if (applyJob(job, res)) setStatus("Готово", false, 1200)
+                              else setStatus("Текст изменился, повторите", true)
+                          } else {
+                              setStatus(err ?: "Ошибка Horrons AI", true, 6000)
+                          }
+                      }
+                  }
+              }
           }
           HRN_EOF
           mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/KeyboardView.kt')"
@@ -295,10 +614,11 @@ jobs:
           import android.view.SoundEffectConstants
           import android.view.View
 
-          /** Клавиатура, нарисованная на Canvas: превью букв, долгое нажатие, повтор стирания, темы. */
+          /** Клавиатура, нарисованная на Canvas: панель инструментов, превью букв, долгое нажатие, темы. */
           class KeyboardView(ctx: Context, private val svc: KeyboardService) : View(ctx) {
 
               private class Slot(val key: Key, val r: RectF)
+              private class ChipSlot(val chip: Chip, val r: RectF, val scale: Float)
 
               private var slots: List<Slot> = emptyList()
               private var rowsCount = 4
@@ -316,12 +636,13 @@ jobs:
               private var pid = -1
               private var longFired = false
               private var topTap = false
+              private var topChip: String? = null
               private var lastX = 0f
 
               private val density = resources.displayMetrics.density
               private fun dp(v: Float): Float = v * density
 
-              private val topH: Float get() = dp(34f)
+              private val topH: Float get() = dp(40f)
               private val gap: Float get() = dp(4f)
               private fun keyH(): Float = dp(42f) * svc.prefs.height / 100f
 
@@ -362,21 +683,83 @@ jobs:
                   setMeasuredDimension(w, totalH().toInt())
               }
 
+              // ---------- верхняя панель ----------
+
+              private fun chipSlots(): List<ChipSlot> {
+                  val chips = svc.toolbar()
+                  val g = dp(6f)
+                  val pad = dp(12f)
+                  val avail = width - dp(8f) - dp(48f)
+                  txt.textSize = dp(13f)
+                  val w = FloatArray(chips.size)
+                  var total = g * (chips.size - 1)
+                  for (i in chips.indices) {
+                      val c = chips[i]
+                      w[i] = txt.measureText(c.label) + (if (c.kind >= 2) dp(4f) else pad * 2)
+                      total += w[i]
+                  }
+                  if (total > avail) {
+                      // сначала сжимаем плашку с текстом состояния
+                      for (i in chips.indices) {
+                          if (chips[i].kind >= 2) {
+                              val others = total - w[i]
+                              w[i] = maxOf(dp(60f), avail - others)
+                              total = others + w[i]
+                          }
+                      }
+                  }
+                  val sc = if (total > avail && total > 0f) avail / total else 1f
+                  val out = ArrayList<ChipSlot>()
+                  var x = dp(8f)
+                  val top = dp(4f)
+                  val h = topH - dp(8f)
+                  for (i in chips.indices) {
+                      val ww = w[i] * sc
+                      out.add(ChipSlot(chips[i], RectF(x, top, x + ww, top + h), sc))
+                      x += ww + g * sc
+                  }
+                  return out
+              }
+
+              private fun topAt(x: Float): String? {
+                  if (x >= width - dp(48f)) return "hide"
+                  for (cs in chipSlots()) {
+                      if (cs.chip.id.isNotEmpty() && x >= cs.r.left - dp(3f) && x <= cs.r.right + dp(3f)) return cs.chip.id
+                  }
+                  return null
+              }
+
               // ---------- отрисовка ----------
 
               override fun onDraw(c: Canvas) {
                   val t = Themes.get(svc.prefs.theme)
                   c.drawColor(t.bg)
 
-                  // верхняя панель: язык слева, «скрыть» справа
+                  // верхняя панель: кнопки инструментов и «скрыть»
+                  for (cs in chipSlots()) {
+                      val ch = cs.chip
+                      if (ch.kind < 2) {
+                          paint.color = when {
+                              topChip == ch.id -> t.pressed
+                              ch.kind == 1 -> t.accent
+                              else -> t.special
+                          }
+                          c.drawRoundRect(cs.r, dp(10f), dp(10f), paint)
+                          txt.color = if (ch.kind == 1) t.accentText else t.text
+                      } else {
+                          txt.color = if (ch.kind == 3) 0xFFFF6B6B.toInt() else t.hint
+                      }
+                      txt.textSize = dp(13f) * cs.scale
+                      var label = ch.label
+                      if (ch.kind >= 2) {
+                          val n = txt.breakText(label, true, cs.r.width(), null)
+                          if (n < label.length) label = label.substring(0, maxOf(0, n - 1)) + "…"
+                      }
+                      c.drawText(label, cs.r.centerX(), cs.r.centerY() - (txt.ascent() + txt.descent()) / 2, txt)
+                  }
                   txt.color = t.hint
-                  txt.textSize = dp(13f)
-                  txt.textAlign = Paint.Align.LEFT
-                  c.drawText(Layouts.names[svc.lang] ?: svc.lang, dp(12f), topH / 2 + dp(5f), txt)
-                  txt.textAlign = Paint.Align.RIGHT
                   txt.textSize = dp(18f)
-                  c.drawText("⌄", width - dp(16f), topH / 2 + dp(6f), txt)
-                  txt.textAlign = Paint.Align.CENTER
+                  c.drawText("⌄", width - dp(24f), topH / 2 + dp(6f), txt)
 
                   val rad = dp(7f)
                   val kh = keyH()
@@ -534,7 +917,7 @@ jobs:
               override fun onTouchEvent(e: MotionEvent): Boolean {
                   when (e.actionMasked) {
                       MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                          if (pressed != null) release(true)
+                          if (pressed != null || topTap) release(true)
                           val i = e.actionIndex
                           pid = e.getPointerId(i)
                           press(e.getX(i), e.getY(i))
@@ -580,6 +963,8 @@ jobs:
                   lastX = x
                   if (y < topH) {
                       topTap = true
+                      topChip = topAt(x)
+                      invalidate()
                       return
                   }
                   val s = find(x, y) ?: return
@@ -616,7 +1001,12 @@ jobs:
                   pressed = null
                   if (topTap) {
                       topTap = false
-                      if (commit && lastX > width - dp(64f)) svc.requestHideSelf(0)
+                      val id = topChip
+                      topChip = null
+                      if (commit && id != null && topAt(lastX) == id) {
+                          feedback()
+                          if (id == "hide") svc.requestHideSelf(0) else svc.onTool(id)
+                      }
                       invalidate()
                       return
                   }
@@ -745,6 +1135,12 @@ jobs:
                   return rows
               }
           }
+
+          /**
+           * Кнопка верхней панели.
+           * kind: 0 — обычная, 1 — выделенная, 2 — текст состояния, 3 — текст ошибки
+           */
+          class Chip(val id: String, val label: String, val kind: Int = 0)
           HRN_EOF
           mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Prefs.kt')"
           cat > 'app/src/main/java/ru/horrons/keyboard/Prefs.kt' <<'HRN_EOF'
@@ -790,6 +1186,29 @@ jobs:
               var langs: List<String>
                   get() = (sp.getString("langs", "ru,en") ?: "ru,en").split(",").filter { it.isNotEmpty() }
                   set(v) { sp.edit().putString("langs", v.joinToString(",")).apply() }
+
+              /** Переводчик: язык исходного текста ("auto" — определить сам) */
+              var trSrc: String
+                  get() = sp.getString("trSrc", "auto") ?: "auto"
+                  set(v) { sp.edit().putString("trSrc", v).apply() }
+
+              /** Переводчик: язык, на который переводим */
+              var trDst: String
+                  get() = sp.getString("trDst", "en") ?: "en"
+                  set(v) { sp.edit().putString("trDst", v).apply() }
+
+              /** Horrons AI: адрес сервера, ключ и модель */
+              var aiUrl: String
+                  get() = sp.getString("aiUrl", "https://api.anthropic.com") ?: "https://api.anthropic.com"
+                  set(v) { sp.edit().putString("aiUrl", v).apply() }
+
+              var aiKey: String
+                  get() = sp.getString("aiKey", "") ?: ""
+                  set(v) { sp.edit().putString("aiKey", v).apply() }
+
+              var aiModel: String
+                  get() = sp.getString("aiModel", "claude-haiku-5-5") ?: "claude-haiku-5-5"
+                  set(v) { sp.edit().putString("aiModel", v).apply() }
           }
           HRN_EOF
           mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/SettingsActivity.kt')"
@@ -801,9 +1220,13 @@ jobs:
           import android.graphics.Typeface
           import android.os.Bundle
           import android.provider.Settings
+          import android.text.Editable
           import android.text.InputType
+          import android.text.TextWatcher
           import android.view.View
           import android.view.inputmethod.InputMethodManager
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
           import android.widget.Button
           import android.widget.CheckBox
           import android.widget.EditText
@@ -812,10 +1235,11 @@ jobs:
           import android.widget.RadioGroup
           import android.widget.ScrollView
           import android.widget.SeekBar
+          import android.widget.Spinner
           import android.widget.Switch
           import android.widget.TextView
 
-          /** Экран настроек: включение клавиатуры, темы, высота, языки, переключатели. */
+          /** Экран настроек: включение клавиатуры, темы, высота, языки, переводчик, Horrons AI. */
           class SettingsActivity : Activity() {
 
               private lateinit var p: Prefs
@@ -841,16 +1265,18 @@ jobs:
                       setPadding(0, 20.dp(), 0, 8.dp())
                   }
 
+                  fun note(text: String) = TextView(this).apply {
+                      this.text = text
+                      textSize = 13f
+                      setPadding(0, 2.dp(), 0, 6.dp())
+                  }
+
                   root.addView(TextView(this).apply {
                       text = "Horrons Клавиатура"
                       textSize = 26f
                       setTypeface(typeface, Typeface.BOLD)
                   })
-                  root.addView(TextView(this).apply {
-                      text = "Включи клавиатуру в системе, выбери её по умолчанию и проверь ниже."
-                      textSize = 14f
-                      setPadding(0, 6.dp(), 0, 12.dp())
-                  })
+                  root.addView(note("Включи клавиатуру в системе, выбери её по умолчанию и проверь ниже."))
 
                   // 1. Включить / выбрать
                   root.addView(Button(this).apply {
@@ -915,7 +1341,7 @@ jobs:
                       boxes.add(cb)
                       root.addView(cb)
                   }
-                  boxes.forEachIndexed { idx, cb ->
+                  boxes.forEach { cb ->
                       cb.setOnCheckedChangeListener { _, _ ->
                           val chosen = order.filterIndexed { i, _ -> boxes[i].isChecked }
                           if (chosen.isEmpty()) {
@@ -942,6 +1368,53 @@ jobs:
                   sw("Вибрация при нажатии", { p.vibrate }, { p.vibrate = it })
                   sw("Звук при нажатии", { p.sound }, { p.sound = it })
                   sw("Заглавная в начале предложения", { p.autoCap }, { p.autoCap = it })
+
+                  // 6. Переводчик
+                  root.addView(title("Переводчик"))
+                  root.addView(note("Перевод работает на телефоне и бесплатный. Языки скачиваются при первом использовании, нужен интернет и сервисы Google. В клавиатуре нажми «🌐 Перевод», затем «Перевести»: текст в поле будет заменён переводом (кнопка ↩ вернёт обратно). В полях паролей перевод отключён."))
+                  val codes = listOf("en", "ru", "uk", "de", "es", "fr", "it", "pt", "tr", "zh", "ja", "ko")
+                  val names = listOf("English", "Русский", "Українська", "Deutsch", "Español", "Français", "Italiano", "Português", "Türkçe", "中文", "日本語", "한국어")
+                  root.addView(TextView(this).apply { text = "Переводить на:" })
+                  root.addView(Spinner(this).apply {
+                      adapter = ArrayAdapter(this@SettingsActivity, android.R.layout.simple_spinner_dropdown_item, names)
+                      setSelection(maxOf(0, codes.indexOf(p.trDst)))
+                      onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                          override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                              p.trDst = codes[pos]
+                          }
+
+                          override fun onNothingSelected(parent: AdapterView<*>?) {}
+                      }
+                  })
+
+                  // 7. Horrons AI
+                  root.addView(title("Horrons AI"))
+                  root.addView(note("Помощник в клавиатуре: исправляет текст, делает короче, вежливее или отвечает на вопрос. Встроенного бесплатного ИИ нет: нужен ключ API любого ИИ-сервиса. Текст из поля отправляется выбранному сервису. В полях паролей помощник отключён. Ключ хранится только на этом телефоне."))
+                  root.addView(note("Для Anthropic оставь адрес по умолчанию. Для других сервисов впиши их адрес вида https://…/v1 (формат OpenAI) и название модели. Если сервис недоступен в твоей стране, нужен VPN."))
+                  fun edit(label: String, value: String, secret: Boolean, onChange: (String) -> Unit) {
+                      root.addView(TextView(this).apply {
+                          text = label
+                          setPadding(0, 10.dp(), 0, 0)
+                      })
+                      root.addView(EditText(this).apply {
+                          setText(value)
+                          inputType = InputType.TYPE_CLASS_TEXT or
+                                  (if (secret) InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_TEXT_VARIATION_URI)
+                          setSingleLine()
+                          addTextChangedListener(object : TextWatcher {
+                              override fun afterTextChanged(s: Editable?) {
+                                  onChange(s?.toString() ?: "")
+                              }
+
+                              override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                              override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                          })
+                      })
+                  }
+                  edit("Адрес сервера", p.aiUrl, false) { p.aiUrl = it }
+                  edit("Ключ API", p.aiKey, true) { p.aiKey = it }
+                  edit("Модель", p.aiModel, false) { p.aiModel = it }
+                  root.addView(note("Как пользоваться: напиши текст в любом поле, нажми «✨ Horrons AI» и выбери действие. «Спросить» отправит написанное как вопрос и заменит его ответом."))
               }
           }
           HRN_EOF
@@ -977,6 +1450,69 @@ jobs:
               )
 
               fun get(i: Int): KbTheme = all[i.coerceIn(0, all.lastIndex)]
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Tr.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Tr.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.nl.translate.Translation
+          import com.google.mlkit.nl.translate.Translator
+          import com.google.mlkit.nl.translate.TranslatorOptions
+
+          /** Перевод на телефоне через Google ML Kit. Языковые модели скачиваются при первом использовании. */
+          object Tr {
+              private val cache = HashMap<String, Translator>()
+
+              /** Грубо определяет язык: кириллица (ru или uk) либо латиница (en). */
+              fun detect(text: String): String {
+                  var cyr = 0
+                  var lat = 0
+                  var uk = false
+                  for (ch in text) {
+                      if ("іїєґІЇЄҐ".indexOf(ch) >= 0) {
+                          cyr++
+                          uk = true
+                      } else if (ch in 'а'..'я' || ch in 'А'..'Я' || ch == 'ё' || ch == 'Ё') {
+                          cyr++
+                      } else if (ch in 'a'..'z' || ch in 'A'..'Z') {
+                          lat++
+                      }
+                  }
+                  return if (cyr > lat) (if (uk) "uk" else "ru") else "en"
+              }
+
+              /** Колбэк вызывается в главном потоке: (результат, ошибка). */
+              fun translate(text: String, srcPref: String, dst: String, cb: (String?, String?) -> Unit) {
+                  val src = if (srcPref == "auto") detect(text) else srcPref
+                  if (src == dst) {
+                      cb(null, "Язык текста и язык перевода совпадают. Нажмите «→ ${dst.uppercase()}» и выберите другой.")
+                      return
+                  }
+                  try {
+                      val key = "$src>$dst"
+                      val tr = cache.getOrPut(key) {
+                          Translation.getClient(
+                              TranslatorOptions.Builder()
+                                  .setSourceLanguage(src)
+                                  .setTargetLanguage(dst)
+                                  .build()
+                          )
+                      }
+                      tr.downloadModelIfNeeded(DownloadConditions.Builder().build())
+                          .addOnSuccessListener {
+                              tr.translate(text)
+                                  .addOnSuccessListener { result -> cb(result, null) }
+                                  .addOnFailureListener { cb(null, "Не удалось перевести") }
+                          }
+                          .addOnFailureListener {
+                              cb(null, "Не удалось скачать язык. Проверьте интернет.")
+                          }
+                  } catch (e: Exception) {
+                      cb(null, "Перевод недоступен на этом телефоне")
+                  }
+              }
           }
           HRN_EOF
           mkdir -p "$(dirname 'app/src/main/res/drawable/ic_launcher.xml')"
@@ -1019,6 +1555,1602 @@ jobs:
           mkdir -p "$(dirname 'gradle.properties')"
           cat > 'gradle.properties' <<'HRN_EOF'
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          HRN_EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'HRN_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "HorronsKeyboard"
+          include(":app")
+          HRN_EOF
+
+      - name: Собрать APK
+        working-directory: HorronsKeyboard
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Сохранить APK как файл сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: HorronsKeyboard-apk
+          path: HorronsKeyboard/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Выложить APK в Releases (прямая ссылка для скачивания)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp HorronsKeyboard/app/build/outputs/apk/debug/app-debug.apk HorronsKeyboard.apk
+          gh release create "build-${{ github.run_number }}" HorronsKeyboard.apk --title "Horrons Клавиатура, сборка ${{ github.run_number }}" --notes "Скачай HorronsKeyboard.apk и установи на телефон."
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+
+      - name: Создать проект Horrons Клавиатура
+        run: |
+          set -e
+          mkdir -p HorronsKeyboard
+          cd HorronsKeyboard
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'HRN_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "ru.horrons.keyboard"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "ru.horrons.keyboard"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("com.google.mlkit:translate:17.0.3")
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'HRN_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".KeyboardService"
+                      android:exported="true"
+                      android:label="@string/ime_name"
+                      android:permission="android.permission.BIND_INPUT_METHOD">
+                      <intent-filter>
+                          <action android:name="android.view.InputMethod" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.view.im"
+                          android:resource="@xml/method" />
+                  </service>
+              </application>
+          </manifest>
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Ai.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Ai.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.os.Handler
+          import android.os.Looper
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /**
+           * Запрос к ИИ. Если адрес содержит anthropic.com, используется формат Anthropic Messages,
+           * иначе формат OpenAI (адрес + /chat/completions), который понимают многие сервисы.
+           */
+          object Ai {
+              private val main = Handler(Looper.getMainLooper())
+
+              /** Колбэк вызывается в главном потоке: (ответ, ошибка). */
+              fun ask(
+                  baseUrl: String,
+                  key: String,
+                  model: String,
+                  system: String,
+                  user: String,
+                  cb: (String?, String?) -> Unit
+              ) {
+                  Thread {
+                      var res: String? = null
+                      var err: String? = null
+                      try {
+                          val base = baseUrl.trim().trimEnd('/')
+                          val anthropic = base.contains("anthropic.com")
+                          val url = URL(if (anthropic) "$base/v1/messages" else "$base/chat/completions")
+                          val c = url.openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"
+                          c.connectTimeout = 15000
+                          c.readTimeout = 60000
+                          c.doOutput = true
+                          c.setRequestProperty("Content-Type", "application/json")
+
+                          val body = JSONObject()
+                          body.put("model", model.trim())
+                          body.put("max_tokens", 1024)
+                          if (anthropic) {
+                              c.setRequestProperty("x-api-key", key.trim())
+                              c.setRequestProperty("anthropic-version", "2023-06-01")
+                              body.put("system", system)
+                              body.put(
+                                  "messages",
+                                  JSONArray().put(JSONObject().put("role", "user").put("content", user))
+                              )
+                          } else {
+                              c.setRequestProperty("Authorization", "Bearer " + key.trim())
+                              body.put(
+                                  "messages",
+                                  JSONArray()
+                                      .put(JSONObject().put("role", "system").put("content", system))
+                                      .put(JSONObject().put("role", "user").put("content", user))
+                              )
+                          }
+                          c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+
+                          val code = c.responseCode
+                          val stream = if (code in 200..299) c.inputStream else c.errorStream
+                          val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                          if (code in 200..299) {
+                              val j = JSONObject(text)
+                              val out: String
+                              if (anthropic) {
+                                  val arr = j.getJSONArray("content")
+                                  val sb = StringBuilder()
+                                  for (i in 0 until arr.length()) {
+                                      val b = arr.getJSONObject(i)
+                                      if (b.optString("type") == "text") sb.append(b.optString("text"))
+                                  }
+                                  out = sb.toString().trim()
+                              } else {
+                                  out = j.getJSONArray("choices").getJSONObject(0)
+                                      .getJSONObject("message").getString("content").trim()
+                              }
+                              if (out.isEmpty()) err = "Пустой ответ" else res = out
+                          } else {
+                              err = explain(code, text)
+                          }
+                      } catch (e: Exception) {
+                          err = "Нет связи с сервером"
+                      }
+                      val fr = res
+                      val fe = err
+                      main.post { cb(fr, fe) }
+                  }.start()
+              }
+
+              private fun explain(code: Int, body: String): String {
+                  var msg = ""
+                  try {
+                      msg = JSONObject(body).optJSONObject("error")?.optString("message") ?: ""
+                  } catch (e: Exception) {
+                  }
+                  val base = when (code) {
+                      401 -> "Ключ не подошёл (401)."
+                      403 -> "Доступ закрыт (403). Возможно, сервис недоступен в вашей стране: нужен VPN."
+                      404 -> "Не найдено (404). Проверьте адрес сервера и название модели."
+                      429 -> "Слишком много запросов (429). Подождите."
+                      else -> "Ошибка сервера ($code)."
+                  }
+                  return if (msg.isNotEmpty()) base + " " + msg.take(80) else base
+              }
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/KeyboardService.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/KeyboardService.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.inputmethodservice.InputMethodService
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.text.InputType
+          import android.view.KeyEvent
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputMethodManager
+
+          class KeyboardService : InputMethodService() {
+
+              lateinit var prefs: Prefs
+              private var kv: KeyboardView? = null
+
+              var lang: String = "ru"
+              var symbols: Boolean = false
+              var page: Int = 0
+
+              /** 0 — выкл, 1 — одна заглавная, 2 — Caps Lock */
+              var shift: Int = 0
+              private var lastShiftTap = 0L
+
+              private var enterLabel = "↵"
+              private var password = false
+
+              // ----- панель инструментов: перевод и Horrons AI -----
+              /** 0 — клавиатура, 1 — перевод, 2 — Horrons AI */
+              var mode: Int = 0
+              var status: String? = null
+              var statusErr: Boolean = false
+              var busy: Boolean = false
+              private var token = 0
+              private var undoText: String? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private val clearRun = Runnable {
+                  status = null
+                  kv?.invalidate()
+              }
+
+              private val srcList = listOf("auto", "en", "ru", "uk", "de", "es", "fr", "it", "pt", "tr", "zh", "ja", "ko")
+
+              private val sys = mapOf(
+                  "fix" to "Ты Horrons AI. Исправь орфографию, пунктуацию и грамматику в тексте пользователя. Сохрани смысл, язык и стиль. Верни только исправленный текст, без пояснений и кавычек.",
+                  "short" to "Ты Horrons AI. Сделай текст пользователя короче, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "polite" to "Ты Horrons AI. Перепиши текст пользователя вежливее и аккуратнее, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "ask" to "Ты Horrons AI, помощник внутри клавиатуры. Ответь на запрос пользователя кратко и по делу, на языке запроса. Верни только готовый ответ, без вступлений."
+              )
+
+              override fun onCreate() {
+                  super.onCreate()
+                  prefs = Prefs(this)
+              }
+
+              override fun onEvaluateFullscreenMode(): Boolean = false
+
+              override fun onCreateInputView(): View {
+                  val v = KeyboardView(this, this)
+                  kv = v
+                  return v
+              }
+
+              override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
+                  super.onStartInputView(info, restarting)
+                  val cls = info.inputType and InputType.TYPE_MASK_CLASS
+                  val variation = info.inputType and InputType.TYPE_MASK_VARIATION
+                  val numeric = cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE
+                  password = (cls == InputType.TYPE_CLASS_TEXT && (
+                          variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                                  variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+                                  variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)) ||
+                          (cls == InputType.TYPE_CLASS_NUMBER && variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD)
+
+                  val langs = prefs.langs.ifEmpty { listOf("ru") }
+                  if (lang !in langs) lang = langs[0]
+                  if (password && "en" in langs) lang = "en"
+
+                  symbols = numeric
+                  page = 0
+                  shift = 0
+
+                  // сбрасываем панель инструментов и устаревшие запросы
+                  mode = 0
+                  token++
+                  busy = false
+                  undoText = null
+                  ui.removeCallbacks(clearRun)
+                  status = null
+
+                  enterLabel = when (info.imeOptions and EditorInfo.IME_MASK_ACTION) {
+                      EditorInfo.IME_ACTION_SEARCH -> "🔍"
+                      EditorInfo.IME_ACTION_SEND -> "➤"
+                      EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_NEXT, EditorInfo.IME_ACTION_PREVIOUS -> "→"
+                      EditorInfo.IME_ACTION_DONE -> "✓"
+                      else -> "↵"
+                  }
+                  updateShift()
+                  kv?.refresh()
+              }
+
+              override fun onUpdateSelection(
+                  oldSelStart: Int, oldSelEnd: Int,
+                  newSelStart: Int, newSelEnd: Int,
+                  candidatesStart: Int, candidatesEnd: Int
+              ) {
+                  super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+                  val before = shift
+                  updateShift()
+                  if (before != shift) kv?.refresh()
+              }
+
+              /** Строки раскладки для текущего состояния. */
+              fun rows(): List<List<Key>> =
+                  Layouts.build(lang, symbols, page, shift > 0, prefs.numberRow, enterLabel)
+
+              /** Автозаглавная буква в начале предложения. */
+              private fun updateShift() {
+                  if (shift == 2) return
+                  if (!prefs.autoCap || password || symbols) {
+                      shift = 0
+                      return
+                  }
+                  val ic = currentInputConnection
+                  val ei = currentInputEditorInfo
+                  shift = if (ic != null && ei != null && ei.inputType != 0 &&
+                      ic.getCursorCapsMode(ei.inputType) != 0
+                  ) 1 else 0
+              }
+
+              fun type(text: String) {
+                  currentInputConnection?.commitText(text, 1)
+                  val before = shift
+                  if (shift == 1) shift = 0
+                  updateShift()
+                  if (before != shift) kv?.refresh()
+              }
+
+              fun backspace() {
+                  val ic = currentInputConnection ?: return
+                  val sel = ic.getSelectedText(0)
+                  if (sel != null && sel.isNotEmpty()) {
+                      ic.commitText("", 1)
+                  } else {
+                      sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+                  }
+                  val before = shift
+                  updateShift()
+                  if (before != shift) kv?.refresh()
+              }
+
+              fun enter() {
+                  val ei = currentInputEditorInfo
+                  val ic = currentInputConnection ?: return
+                  if (ei == null) {
+                      sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+                      return
+                  }
+                  val action = ei.imeOptions and EditorInfo.IME_MASK_ACTION
+                  val multiLine = (ei.inputType and InputType.TYPE_TEXT_FLAG_MULTI_LINE) != 0
+                  val noAction = (ei.imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+                  if (!multiLine && !noAction &&
+                      action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED
+                  ) {
+                      ic.performEditorAction(action)
+                  } else {
+                      sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+                  }
+              }
+
+              fun onShift() {
+                  val now = SystemClock.uptimeMillis()
+                  shift = when {
+                      shift == 1 && now - lastShiftTap < 350 -> 2
+                      shift != 0 -> 0
+                      else -> 1
+                  }
+                  lastShiftTap = now
+                  kv?.refresh()
+              }
+
+              fun toggleSymbols() {
+                  symbols = !symbols
+                  page = 0
+                  if (symbols) shift = 0 else updateShift()
+                  kv?.refresh()
+              }
+
+              fun togglePage() {
+                  page = 1 - page
+                  kv?.refresh()
+              }
+
+              fun nextLang() {
+                  val langs = prefs.langs.ifEmpty { listOf("ru") }
+                  if (langs.size <= 1) {
+                      showPicker()
+                      return
+                  }
+                  val i = langs.indexOf(lang)
+                  lang = langs[(i + 1) % langs.size]
+                  symbols = false
+                  page = 0
+                  updateShift()
+                  kv?.refresh()
+              }
+
+              fun showPicker() {
+                  val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+                  imm.showInputMethodPicker()
+              }
+
+              // ================= панель инструментов =================
+
+              /** Кнопки верхней панели в текущем режиме. */
+              fun toolbar(): List<Chip> {
+                  val st = status
+                  if (st != null) {
+                      return listOf(
+                          Chip("", st, if (statusErr) 3 else 2),
+                          Chip("clear", if (busy) "✕" else "OK")
+                      )
+                  }
+                  val out = ArrayList<Chip>()
+                  when (mode) {
+                      1 -> {
+                          out.add(Chip("src", if (prefs.trSrc == "auto") "Авто" else prefs.trSrc.uppercase()))
+                          out.add(Chip("dst", "→ " + prefs.trDst.uppercase()))
+                          out.add(Chip("go", "Перевести", 1))
+                          if (undoText != null) out.add(Chip("undo", "↩"))
+                          out.add(Chip("close", "✕"))
+                      }
+                      2 -> {
+                          out.add(Chip("fix", "Исправить"))
+                          out.add(Chip("short", "Короче"))
+                          out.add(Chip("polite", "Вежливо"))
+                          out.add(Chip("ask", "Спросить", 1))
+                          if (undoText != null) out.add(Chip("undo", "↩"))
+                          out.add(Chip("close", "✕"))
+                      }
+                      else -> {
+                          out.add(Chip("tr", "🌐 Перевод"))
+                          out.add(Chip("ai", "✨ Horrons AI"))
+                      }
+                  }
+                  return out
+              }
+
+              fun onTool(id: String) {
+                  if (busy && id != "clear") return
+                  when (id) {
+                      "tr" -> {
+                          mode = 1
+                          kv?.invalidate()
+                      }
+                      "ai" -> {
+                          mode = 2
+                          kv?.invalidate()
+                      }
+                      "close" -> {
+                          mode = 0
+                          setStatus(null)
+                      }
+                      "clear" -> {
+                          token++
+                          busy = false
+                          setStatus(null)
+                      }
+                      "src" -> {
+                          val i = srcList.indexOf(prefs.trSrc)
+                          prefs.trSrc = srcList[(i + 1) % srcList.size]
+                          kv?.invalidate()
+                      }
+                      "dst" -> {
+                          val l = srcList.drop(1)
+                          val i = l.indexOf(prefs.trDst)
+                          prefs.trDst = l[(i + 1) % l.size]
+                          kv?.invalidate()
+                      }
+                      "go" -> doTranslate()
+                      "fix", "short", "polite", "ask" -> doAi(id)
+                      "undo" -> doUndo()
+                  }
+              }
+
+              private fun setStatus(msg: String?, err: Boolean = false, ms: Long = 2500) {
+                  status = msg
+                  statusErr = err
+                  ui.removeCallbacks(clearRun)
+                  if (msg != null && !busy && ms > 0) ui.postDelayed(clearRun, ms)
+                  kv?.invalidate()
+              }
+
+              private class Job(val orig: String, val sel: Boolean, val before: Int, val after: Int)
+
+              /** Текст для обработки: выделенный или весь текст поля вокруг курсора. */
+              private fun readField(): Job? {
+                  val ic = currentInputConnection ?: return null
+                  val sel = ic.getSelectedText(0)
+                  if (sel != null && sel.isNotEmpty()) return Job(sel.toString(), true, 0, 0)
+                  val b = ic.getTextBeforeCursor(3000, 0)?.toString() ?: ""
+                  val a = ic.getTextAfterCursor(3000, 0)?.toString() ?: ""
+                  val all = b + a
+                  return if (all.isBlank()) null else Job(all, false, b.length, a.length)
+              }
+
+              /** Заменяет исходный текст результатом. false, если за время ожидания текст изменился. */
+              private fun applyJob(job: Job, result: String): Boolean {
+                  val ic = currentInputConnection ?: return false
+                  val now = readField()
+                  if (now == null || now.orig != job.orig) return false
+                  if (!job.sel) ic.deleteSurroundingText(job.before, job.after)
+                  ic.commitText(result, 1)
+                  undoText = job.orig
+                  return true
+              }
+
+              private fun doUndo() {
+                  val u = undoText ?: return
+                  val ic = currentInputConnection ?: return
+                  val job = readField()
+                  if (job != null && !job.sel) ic.deleteSurroundingText(job.before, job.after)
+                  ic.commitText(u, 1)
+                  undoText = null
+                  setStatus("Возвращено", false, 1500)
+              }
+
+              private fun doTranslate() {
+                  if (password) {
+                      setStatus("В полях пароля перевод отключён", true)
+                      return
+                  }
+                  val job = readField() ?: run {
+                      setStatus("Сначала напишите текст в поле", true)
+                      return
+                  }
+                  busy = true
+                  val my = ++token
+                  setStatus("Перевожу…", false)
+                  Tr.translate(job.orig, prefs.trSrc, prefs.trDst) { res, err ->
+                      if (my == token) {
+                          busy = false
+                          if (res != null) {
+                              if (applyJob(job, res)) setStatus("Готово", false, 1200)
+                              else setStatus("Текст изменился, повторите", true)
+                          } else {
+                              setStatus(err ?: "Ошибка перевода", true, 5000)
+                          }
+                      }
+                  }
+              }
+
+              private fun doAi(kind: String) {
+                  if (password) {
+                      setStatus("В полях пароля помощник отключён", true)
+                      return
+                  }
+                  if (prefs.aiKey.isBlank()) {
+                      setStatus("Нужен ключ API. Откройте приложение Horrons Клавиатура, раздел Horrons AI.", true, 6000)
+                      return
+                  }
+                  val job = readField() ?: run {
+                      setStatus("Сначала напишите текст в поле", true)
+                      return
+                  }
+                  busy = true
+                  val my = ++token
+                  setStatus("Horrons AI думает…", false)
+                  Ai.ask(prefs.aiUrl, prefs.aiKey, prefs.aiModel, sys.getValue(kind), job.orig) { res, err ->
+                      if (my == token) {
+                          busy = false
+                          if (res != null) {
+                              if (applyJob(job, res)) setStatus("Готово", false, 1200)
+                              else setStatus("Текст изменился, повторите", true)
+                          } else {
+                              setStatus(err ?: "Ошибка Horrons AI", true, 6000)
+                          }
+                      }
+                  }
+              }
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/KeyboardView.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/KeyboardView.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.SoundEffectConstants
+          import android.view.View
+
+          /** Клавиатура, нарисованная на Canvas: панель инструментов, превью букв, долгое нажатие, темы. */
+          class KeyboardView(ctx: Context, private val svc: KeyboardService) : View(ctx) {
+
+              private class Slot(val key: Key, val r: RectF)
+              private class ChipSlot(val chip: Chip, val r: RectF, val scale: Float)
+
+              private var slots: List<Slot> = emptyList()
+              private var rowsCount = 4
+
+              private val uiHandler = Handler(Looper.getMainLooper())
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeCap = Paint.Cap.ROUND
+                  strokeJoin = Paint.Join.ROUND
+              }
+              private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+
+              private var pressed: Slot? = null
+              private var pid = -1
+              private var longFired = false
+              private var topTap = false
+              private var topChip: String? = null
+              private var lastX = 0f
+
+              private val density = resources.displayMetrics.density
+              private fun dp(v: Float): Float = v * density
+
+              private val topH: Float get() = dp(40f)
+              private val gap: Float get() = dp(4f)
+              private fun keyH(): Float = dp(42f) * svc.prefs.height / 100f
+
+              fun refresh() {
+                  requestLayout()
+                  invalidate()
+              }
+
+              // ---------- размеры ----------
+
+              private fun layoutSlots(w: Float) {
+                  val rows = svc.rows()
+                  rowsCount = rows.size
+                  val out = ArrayList<Slot>()
+                  val padX = dp(3f)
+                  val kh = keyH()
+                  var y = topH + dp(4f)
+                  for (row in rows) {
+                      var total = 0f
+                      for (k in row) total += k.weight
+                      val avail = w - 2 * padX - gap * (row.size - 1)
+                      var x = padX
+                      for (k in row) {
+                          val kw = avail * k.weight / total
+                          if (k.kind != Kind.SPACER) out.add(Slot(k, RectF(x, y, x + kw, y + kh)))
+                          x += kw + gap
+                      }
+                      y += kh + gap
+                  }
+                  slots = out
+              }
+
+              private fun totalH(): Float = topH + dp(4f) + rowsCount * (keyH() + gap) + dp(6f)
+
+              override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                  val w = MeasureSpec.getSize(widthMeasureSpec)
+                  layoutSlots(w.toFloat())
+                  setMeasuredDimension(w, totalH().toInt())
+              }
+
+              // ---------- верхняя панель ----------
+
+              private fun chipSlots(): List<ChipSlot> {
+                  val chips = svc.toolbar()
+                  val g = dp(6f)
+                  val pad = dp(12f)
+                  val avail = width - dp(8f) - dp(48f)
+                  txt.textSize = dp(13f)
+                  val w = FloatArray(chips.size)
+                  var total = g * (chips.size - 1)
+                  for (i in chips.indices) {
+                      val c = chips[i]
+                      w[i] = txt.measureText(c.label) + (if (c.kind >= 2) dp(4f) else pad * 2)
+                      total += w[i]
+                  }
+                  if (total > avail) {
+                      // сначала сжимаем плашку с текстом состояния
+                      for (i in chips.indices) {
+                          if (chips[i].kind >= 2) {
+                              val others = total - w[i]
+                              w[i] = maxOf(dp(60f), avail - others)
+                              total = others + w[i]
+                          }
+                      }
+                  }
+                  val sc = if (total > avail && total > 0f) avail / total else 1f
+                  val out = ArrayList<ChipSlot>()
+                  var x = dp(8f)
+                  val top = dp(4f)
+                  val h = topH - dp(8f)
+                  for (i in chips.indices) {
+                      val ww = w[i] * sc
+                      out.add(ChipSlot(chips[i], RectF(x, top, x + ww, top + h), sc))
+                      x += ww + g * sc
+                  }
+                  return out
+              }
+
+              private fun topAt(x: Float): String? {
+                  if (x >= width - dp(48f)) return "hide"
+                  for (cs in chipSlots()) {
+                      if (cs.chip.id.isNotEmpty() && x >= cs.r.left - dp(3f) && x <= cs.r.right + dp(3f)) return cs.chip.id
+                  }
+                  return null
+              }
+
+              // ---------- отрисовка ----------
+
+              override fun onDraw(c: Canvas) {
+                  val t = Themes.get(svc.prefs.theme)
+                  c.drawColor(t.bg)
+
+                  // верхняя панель: кнопки инструментов и «скрыть»
+                  for (cs in chipSlots()) {
+                      val ch = cs.chip
+                      if (ch.kind < 2) {
+                          paint.color = when {
+                              topChip == ch.id -> t.pressed
+                              ch.kind == 1 -> t.accent
+                              else -> t.special
+                          }
+                          c.drawRoundRect(cs.r, dp(10f), dp(10f), paint)
+                          txt.color = if (ch.kind == 1) t.accentText else t.text
+                      } else {
+                          txt.color = if (ch.kind == 3) 0xFFFF6B6B.toInt() else t.hint
+                      }
+                      txt.textSize = dp(13f) * cs.scale
+                      var label = ch.label
+                      if (ch.kind >= 2) {
+                          val n = txt.breakText(label, true, cs.r.width(), null)
+                          if (n < label.length) label = label.substring(0, maxOf(0, n - 1)) + "…"
+                      }
+                      c.drawText(label, cs.r.centerX(), cs.r.centerY() - (txt.ascent() + txt.descent()) / 2, txt)
+                  }
+                  txt.color = t.hint
+                  txt.textSize = dp(18f)
+                  c.drawText("⌄", width - dp(24f), topH / 2 + dp(6f), txt)
+
+                  val rad = dp(7f)
+                  val kh = keyH()
+                  for (s in slots) {
+                      val k = s.key
+                      paint.color = when {
+                          s === pressed -> t.pressed
+                          k.kind == Kind.ENTER -> t.accent
+                          k.kind == Kind.SHIFT && svc.shift > 0 -> t.text
+                          k.kind == Kind.CHAR || k.kind == Kind.SPACE -> t.key
+                          else -> t.special
+                      }
+                      c.drawRoundRect(s.r, rad, rad, paint)
+                      drawLabel(c, s, t, kh)
+                  }
+
+                  // превью нажатой буквы
+                  val ps = pressed
+                  if (ps != null && svc.prefs.preview && ps.key.kind == Kind.CHAR && !longFired) {
+                      val bw = ps.r.width() * 1.3f
+                      val bottom = ps.r.top - dp(2f)
+                      val bh = minOf(dp(54f), bottom)
+                      if (bh > dp(20f)) {
+                          val left = (ps.r.centerX() - bw / 2).coerceIn(dp(2f), maxOf(dp(2f), width - bw - dp(2f)))
+                          val r = RectF(left, bottom - bh, left + bw, bottom)
+                          paint.color = t.preview
+                          c.drawRoundRect(r, dp(10f), dp(10f), paint)
+                          txt.color = t.text
+                          txt.textSize = bh * 0.6f
+                          c.drawText(ps.key.out, r.centerX(), r.centerY() - (txt.ascent() + txt.descent()) / 2, txt)
+                      }
+                  }
+              }
+
+              private fun drawLabel(c: Canvas, s: Slot, t: KbTheme, kh: Float) {
+                  val k = s.key
+                  val cx = s.r.centerX()
+                  val cy = s.r.centerY()
+                  when (k.kind) {
+                      Kind.BACKSPACE -> drawBackspace(c, cx, cy, t.text)
+                      Kind.SHIFT -> {
+                          val on = svc.shift > 0
+                          drawShift(c, cx, cy, if (on) t.bg else t.text, svc.shift == 2, svc.shift == 2)
+                      }
+                      else -> {
+                          txt.color = when (k.kind) {
+                              Kind.ENTER -> t.accentText
+                              Kind.SPACE -> t.hint
+                              else -> t.text
+                          }
+                          txt.textSize = when {
+                              k.kind == Kind.SPACE -> kh * 0.32f
+                              k.small -> kh * 0.38f
+                              k.kind == Kind.SYMBOLS || k.kind == Kind.PAGE -> kh * 0.34f
+                              else -> kh * 0.46f
+                          }
+                          c.drawText(k.label, cx, cy - (txt.ascent() + txt.descent()) / 2, txt)
+
+                          // подсказка о долгом нажатии в углу клавиши
+                          if (k.kind == Kind.CHAR && !k.small) {
+                              val a = alt(k)
+                              if (a != null) {
+                                  txt.color = t.hint
+                                  txt.textSize = kh * 0.24f
+                                  c.drawText(a, s.r.right - dp(7f), s.r.top + kh * 0.3f, txt)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun drawBackspace(c: Canvas, cx: Float, cy: Float, color: Int) {
+                  val s = dp(9f)
+                  stroke.color = color
+                  stroke.strokeWidth = dp(1.8f)
+                  val p = Path()
+                  p.moveTo(cx - s * 1.1f, cy)
+                  p.lineTo(cx - s * 0.35f, cy - s * 0.75f)
+                  p.lineTo(cx + s * 1.1f, cy - s * 0.75f)
+                  p.lineTo(cx + s * 1.1f, cy + s * 0.75f)
+                  p.lineTo(cx - s * 0.35f, cy + s * 0.75f)
+                  p.close()
+                  c.drawPath(p, stroke)
+                  c.drawLine(cx - s * 0.05f, cy - s * 0.3f, cx + s * 0.65f, cy + s * 0.3f, stroke)
+                  c.drawLine(cx + s * 0.65f, cy - s * 0.3f, cx - s * 0.05f, cy + s * 0.3f, stroke)
+              }
+
+              private fun drawShift(c: Canvas, cx: Float, cy: Float, color: Int, filled: Boolean, lock: Boolean) {
+                  val s = dp(9f)
+                  val p = Path()
+                  p.moveTo(cx, cy - s)
+                  p.lineTo(cx + s, cy + s * 0.05f)
+                  p.lineTo(cx + s * 0.45f, cy + s * 0.05f)
+                  p.lineTo(cx + s * 0.45f, cy + s * 0.75f)
+                  p.lineTo(cx - s * 0.45f, cy + s * 0.75f)
+                  p.lineTo(cx - s * 0.45f, cy + s * 0.05f)
+                  p.lineTo(cx - s, cy + s * 0.05f)
+                  p.close()
+                  paint.color = color
+                  stroke.color = color
+                  stroke.strokeWidth = dp(1.8f)
+                  if (filled) c.drawPath(p, paint) else c.drawPath(p, stroke)
+                  if (lock) c.drawLine(cx - s * 0.45f, cy + s * 1.05f, cx + s * 0.45f, cy + s * 1.05f, stroke)
+              }
+
+              // ---------- долгое нажатие ----------
+
+              /** Что вводится долгим нажатием на клавишу (или null). */
+              private fun alt(k: Key): String? {
+                  if (k.kind != Kind.CHAR || k.small) return null
+                  val base = k.out.lowercase()
+                  if (svc.lang == "ru") {
+                      val sp = Layouts.longPress[base]
+                      if (sp != null) return if (k.out != base) sp.uppercase() else sp
+                  }
+                  if (!svc.prefs.numberRow && !svc.symbols) {
+                      val i = Layouts.topRowIndex(svc.lang, base)
+                      if (i >= 0) return "1234567890"[i].toString()
+                  }
+                  return null
+              }
+
+              private val longRun = Runnable {
+                  val s = pressed
+                  if (s != null) {
+                      val k = s.key
+                      if (k.kind == Kind.LANG) {
+                          longFired = true
+                          svc.showPicker()
+                          pressed = null
+                          invalidate()
+                      } else {
+                          val a = alt(k)
+                          if (a != null) {
+                              longFired = true
+                              feedback()
+                              svc.type(a)
+                              invalidate()
+                          }
+                      }
+                  }
+              }
+
+              private val repeatRun = object : Runnable {
+                  override fun run() {
+                      if (pressed?.key?.kind == Kind.BACKSPACE) {
+                          svc.backspace()
+                          uiHandler.postDelayed(this, 50)
+                      }
+                  }
+              }
+
+              // ---------- касания ----------
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                          if (pressed != null || topTap) release(true)
+                          val i = e.actionIndex
+                          pid = e.getPointerId(i)
+                          press(e.getX(i), e.getY(i))
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          val i = e.findPointerIndex(pid)
+                          if (i >= 0) slide(e.getX(i), e.getY(i))
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                          val i = e.actionIndex
+                          if (e.getPointerId(i) == pid) {
+                              lastX = e.getX(i)
+                              release(true)
+                              pid = -1
+                          }
+                      }
+                      MotionEvent.ACTION_CANCEL -> {
+                          release(false)
+                          pid = -1
+                      }
+                  }
+                  return true
+              }
+
+              private fun find(x: Float, y: Float): Slot? {
+                  var best: Slot? = null
+                  var bd = Float.MAX_VALUE
+                  for (s in slots) {
+                      val dx = maxOf(s.r.left - x, 0f, x - s.r.right)
+                      val dy = maxOf(s.r.top - y, 0f, y - s.r.bottom)
+                      val dd = dx * dx + dy * dy
+                      if (dd < bd) {
+                          bd = dd
+                          best = s
+                      }
+                  }
+                  val tol = dp(10f)
+                  return if (bd <= tol * tol) best else null
+              }
+
+              private fun press(x: Float, y: Float) {
+                  longFired = false
+                  lastX = x
+                  if (y < topH) {
+                      topTap = true
+                      topChip = topAt(x)
+                      invalidate()
+                      return
+                  }
+                  val s = find(x, y) ?: return
+                  pressed = s
+                  feedback()
+                  val k = s.key
+                  if (k.kind == Kind.BACKSPACE) {
+                      svc.backspace()
+                      uiHandler.postDelayed(repeatRun, 400)
+                  } else if (alt(k) != null || k.kind == Kind.LANG) {
+                      uiHandler.postDelayed(longRun, 380)
+                  }
+                  invalidate()
+              }
+
+              private fun slide(x: Float, y: Float) {
+                  lastX = x
+                  val cur = pressed ?: return
+                  if (cur.key.kind == Kind.BACKSPACE) return
+                  val s = find(x, y) ?: return
+                  if (s !== cur) {
+                      uiHandler.removeCallbacks(longRun)
+                      longFired = false
+                      pressed = s
+                      if (alt(s.key) != null) uiHandler.postDelayed(longRun, 380)
+                      invalidate()
+                  }
+              }
+
+              private fun release(commit: Boolean) {
+                  uiHandler.removeCallbacks(longRun)
+                  uiHandler.removeCallbacks(repeatRun)
+                  val s = pressed
+                  pressed = null
+                  if (topTap) {
+                      topTap = false
+                      val id = topChip
+                      topChip = null
+                      if (commit && id != null && topAt(lastX) == id) {
+                          feedback()
+                          if (id == "hide") svc.requestHideSelf(0) else svc.onTool(id)
+                      }
+                      invalidate()
+                      return
+                  }
+                  if (commit && s != null && !longFired && s.key.kind != Kind.BACKSPACE) act(s.key)
+                  longFired = false
+                  invalidate()
+              }
+
+              private fun act(k: Key) {
+                  when (k.kind) {
+                      Kind.CHAR -> svc.type(k.out)
+                      Kind.SPACE -> svc.type(" ")
+                      Kind.SHIFT -> svc.onShift()
+                      Kind.SYMBOLS -> svc.toggleSymbols()
+                      Kind.PAGE -> svc.togglePage()
+                      Kind.LANG -> svc.nextLang()
+                      Kind.ENTER -> svc.enter()
+                      else -> {}
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun feedback() {
+                  if (svc.prefs.vibrate) {
+                      performHapticFeedback(
+                          HapticFeedbackConstants.KEYBOARD_TAP,
+                          HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING
+                      )
+                  }
+                  if (svc.prefs.sound) playSoundEffect(SoundEffectConstants.CLICK)
+              }
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Layouts.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Layouts.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          enum class Kind { CHAR, SHIFT, BACKSPACE, SYMBOLS, PAGE, LANG, SPACE, ENTER, SPACER }
+
+          /**
+           * @param label что нарисовано на клавише
+           * @param out   что вводится (для обычных символов)
+           * @param weight относительная ширина клавиши в ряду
+           * @param small мелкий шрифт (цифры)
+           */
+          class Key(
+              val label: String,
+              val out: String = label,
+              val kind: Kind = Kind.CHAR,
+              val weight: Float = 1f,
+              val small: Boolean = false
+          )
+
+          object Layouts {
+              val names = mapOf("ru" to "Русский", "en" to "English", "uk" to "Українська")
+
+              val letters = mapOf(
+                  "ru" to listOf("йцукенгшщзхъ", "фывапролджэ", "ячсмитьбю"),
+                  "en" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
+                  "uk" to listOf("йцукенгшщзхї", "фівапролджє", "ячсмитьбюґ")
+              )
+
+              /** Что вводится долгим нажатием (только для русской раскладки) */
+              val longPress = mapOf("е" to "ё")
+
+              /** Позиция буквы в верхнем ряду (0..9) для цифр долгим нажатием, или -1 */
+              fun topRowIndex(lang: String, ch: String): Int {
+                  val top = letters[lang]?.get(0) ?: return -1
+                  val i = top.indexOf(ch)
+                  return if (i in 0..9) i else -1
+              }
+
+              fun build(
+                  lang: String,
+                  sym: Boolean,
+                  page: Int,
+                  shift: Boolean,
+                  numRow: Boolean,
+                  enter: String
+              ): List<List<Key>> {
+                  val rows = ArrayList<List<Key>>()
+
+                  fun chars(s: String, small: Boolean = false): List<Key> =
+                      s.map { Key(it.toString(), small = small) }
+
+                  fun cased(s: String): List<Key> =
+                      s.map { Key(if (shift) it.toString().uppercase() else it.toString()) }
+
+                  fun pad(keys: List<Key>): List<Key> {
+                      val n = keys.size
+                      if (n >= 10) return keys
+                      val w = (10 - n) / 2f
+                      return listOf(Key("", kind = Kind.SPACER, weight = w)) + keys + Key("", kind = Kind.SPACER, weight = w)
+                  }
+
+                  if (numRow || sym) rows.add(chars("1234567890", true))
+                  val bsp = Key("⌫", "", Kind.BACKSPACE, 1.5f)
+
+                  if (sym) {
+                      if (page == 0) {
+                          rows.add(chars("@#\$%&-+()/"))
+                          rows.add(listOf(Key("=\\<", "", Kind.PAGE, 1.5f)) + chars("*\"':;!?") + bsp)
+                      } else {
+                          rows.add(chars("~`|•√π÷×¶∆"))
+                          rows.add(listOf(Key("123", "", Kind.PAGE, 1.5f)) + chars("£€¥°=[]") + bsp)
+                      }
+                  } else {
+                      val l = letters[lang] ?: letters.getValue("en")
+                      rows.add(pad(cased(l[0])))
+                      rows.add(pad(cased(l[1])))
+                      rows.add(listOf(Key("⇧", "", Kind.SHIFT, 1.5f)) + cased(l[2]) + bsp)
+                  }
+
+                  val langName = names[lang] ?: lang
+                  val symLabel = if (sym) (if (lang == "en") "ABC" else "АБВ") else "?123"
+                  rows.add(
+                      listOf(
+                          Key(symLabel, "", Kind.SYMBOLS, 1.4f),
+                          Key(","),
+                          Key("🌐", "", Kind.LANG, 1f),
+                          Key(langName, " ", Kind.SPACE, 4f),
+                          Key("."),
+                          Key(enter, "", Kind.ENTER, 1.4f)
+                      )
+                  )
+                  return rows
+              }
+          }
+
+          /**
+           * Кнопка верхней панели.
+           * kind: 0 — обычная, 1 — выделенная, 2 — текст состояния, 3 — текст ошибки
+           */
+          class Chip(val id: String, val label: String, val kind: Int = 0)
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Prefs.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Prefs.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.content.Context
+          import android.content.SharedPreferences
+
+          /** Настройки клавиатуры. Хранятся в SharedPreferences и общие для сервиса и экрана настроек. */
+          class Prefs(ctx: Context) {
+              private val sp: SharedPreferences = ctx.getSharedPreferences("kb", Context.MODE_PRIVATE)
+
+              var theme: Int
+                  get() = sp.getInt("theme", 0)
+                  set(v) { sp.edit().putInt("theme", v).apply() }
+
+              /** Высота клавиш в процентах: 70..130 */
+              var height: Int
+                  get() = sp.getInt("height", 100)
+                  set(v) { sp.edit().putInt("height", v).apply() }
+
+              var vibrate: Boolean
+                  get() = sp.getBoolean("vibrate", true)
+                  set(v) { sp.edit().putBoolean("vibrate", v).apply() }
+
+              var sound: Boolean
+                  get() = sp.getBoolean("sound", false)
+                  set(v) { sp.edit().putBoolean("sound", v).apply() }
+
+              var preview: Boolean
+                  get() = sp.getBoolean("preview", true)
+                  set(v) { sp.edit().putBoolean("preview", v).apply() }
+
+              var numberRow: Boolean
+                  get() = sp.getBoolean("numberRow", true)
+                  set(v) { sp.edit().putBoolean("numberRow", v).apply() }
+
+              var autoCap: Boolean
+                  get() = sp.getBoolean("autoCap", true)
+                  set(v) { sp.edit().putBoolean("autoCap", v).apply() }
+
+              /** Включённые языки, например ["ru", "en"] */
+              var langs: List<String>
+                  get() = (sp.getString("langs", "ru,en") ?: "ru,en").split(",").filter { it.isNotEmpty() }
+                  set(v) { sp.edit().putString("langs", v.joinToString(",")).apply() }
+
+              /** Переводчик: язык исходного текста ("auto" — определить сам) */
+              var trSrc: String
+                  get() = sp.getString("trSrc", "auto") ?: "auto"
+                  set(v) { sp.edit().putString("trSrc", v).apply() }
+
+              /** Переводчик: язык, на который переводим */
+              var trDst: String
+                  get() = sp.getString("trDst", "en") ?: "en"
+                  set(v) { sp.edit().putString("trDst", v).apply() }
+
+              /** Horrons AI: адрес сервера, ключ и модель */
+              var aiUrl: String
+                  get() = sp.getString("aiUrl", "https://api.anthropic.com") ?: "https://api.anthropic.com"
+                  set(v) { sp.edit().putString("aiUrl", v).apply() }
+
+              var aiKey: String
+                  get() = sp.getString("aiKey", "") ?: ""
+                  set(v) { sp.edit().putString("aiKey", v).apply() }
+
+              var aiModel: String
+                  get() = sp.getString("aiModel", "claude-haiku-5-5") ?: "claude-haiku-5-5"
+                  set(v) { sp.edit().putString("aiModel", v).apply() }
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/SettingsActivity.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/SettingsActivity.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.Editable
+          import android.text.InputType
+          import android.text.TextWatcher
+          import android.view.View
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Spinner
+          import android.widget.Switch
+          import android.widget.TextView
+
+          /** Экран настроек: включение клавиатуры, темы, высота, языки, переводчик, Horrons AI. */
+          class SettingsActivity : Activity() {
+
+              private lateinit var p: Prefs
+
+              private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  p = Prefs(this)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(16.dp(), 16.dp(), 16.dp(), 32.dp())
+                  }
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+
+                  fun title(text: String) = TextView(this).apply {
+                      this.text = text
+                      textSize = 18f
+                      setTypeface(typeface, Typeface.BOLD)
+                      setPadding(0, 20.dp(), 0, 8.dp())
+                  }
+
+                  fun note(text: String) = TextView(this).apply {
+                      this.text = text
+                      textSize = 13f
+                      setPadding(0, 2.dp(), 0, 6.dp())
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "Horrons Клавиатура"
+                      textSize = 26f
+                      setTypeface(typeface, Typeface.BOLD)
+                  })
+                  root.addView(note("Включи клавиатуру в системе, выбери её по умолчанию и проверь ниже."))
+
+                  // 1. Включить / выбрать
+                  root.addView(Button(this).apply {
+                      text = "1. Включить клавиатуру в настройках"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "2. Выбрать Horrons Клавиатуру"
+                      setOnClickListener {
+                          (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                      }
+                  })
+                  root.addView(EditText(this).apply {
+                      hint = "Проверь клавиатуру здесь"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                  })
+
+                  // 2. Темы
+                  root.addView(title("Тема"))
+                  val group = RadioGroup(this)
+                  Themes.all.forEachIndexed { i, t ->
+                      group.addView(RadioButton(this).apply {
+                          id = View.generateViewId()
+                          text = t.name
+                          isChecked = i == p.theme
+                          setOnClickListener { p.theme = i }
+                      })
+                  }
+                  root.addView(group)
+
+                  // 3. Высота
+                  val heightLabel = TextView(this)
+                  fun updHeight() {
+                      heightLabel.text = "Высота клавиш: ${p.height}%"
+                  }
+                  updHeight()
+                  root.addView(title("Размер"))
+                  root.addView(heightLabel)
+                  root.addView(SeekBar(this).apply {
+                      max = 60
+                      progress = p.height - 70
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(sb: SeekBar, value: Int, fromUser: Boolean) {
+                              p.height = 70 + value
+                              updHeight()
+                          }
+
+                          override fun onStartTrackingTouch(sb: SeekBar) {}
+                          override fun onStopTrackingTouch(sb: SeekBar) {}
+                      })
+                  })
+
+                  // 4. Языки
+                  root.addView(title("Языки"))
+                  val order = listOf("ru", "en", "uk")
+                  val boxes = ArrayList<CheckBox>()
+                  order.forEach { code ->
+                      val cb = CheckBox(this).apply {
+                          text = Layouts.names[code]
+                          isChecked = code in p.langs
+                      }
+                      boxes.add(cb)
+                      root.addView(cb)
+                  }
+                  boxes.forEach { cb ->
+                      cb.setOnCheckedChangeListener { _, _ ->
+                          val chosen = order.filterIndexed { i, _ -> boxes[i].isChecked }
+                          if (chosen.isEmpty()) {
+                              // хотя бы один язык должен остаться
+                              cb.isChecked = true
+                          } else {
+                              p.langs = chosen
+                          }
+                      }
+                  }
+
+                  // 5. Переключатели
+                  root.addView(title("Поведение"))
+                  fun sw(label: String, get: () -> Boolean, set: (Boolean) -> Unit) {
+                      root.addView(Switch(this).apply {
+                          text = label
+                          isChecked = get()
+                          setPadding(0, 8.dp(), 0, 8.dp())
+                          setOnCheckedChangeListener { _, v -> set(v) }
+                      })
+                  }
+                  sw("Ряд с цифрами", { p.numberRow }, { p.numberRow = it })
+                  sw("Превью символов", { p.preview }, { p.preview = it })
+                  sw("Вибрация при нажатии", { p.vibrate }, { p.vibrate = it })
+                  sw("Звук при нажатии", { p.sound }, { p.sound = it })
+                  sw("Заглавная в начале предложения", { p.autoCap }, { p.autoCap = it })
+
+                  // 6. Переводчик
+                  root.addView(title("Переводчик"))
+                  root.addView(note("Перевод работает на телефоне и бесплатный. Языки скачиваются при первом использовании, нужен интернет и сервисы Google. В клавиатуре нажми «🌐 Перевод», затем «Перевести»: текст в поле будет заменён переводом (кнопка ↩ вернёт обратно). В полях паролей перевод отключён."))
+                  val codes = listOf("en", "ru", "uk", "de", "es", "fr", "it", "pt", "tr", "zh", "ja", "ko")
+                  val names = listOf("English", "Русский", "Українська", "Deutsch", "Español", "Français", "Italiano", "Português", "Türkçe", "中文", "日本語", "한국어")
+                  root.addView(TextView(this).apply { text = "Переводить на:" })
+                  root.addView(Spinner(this).apply {
+                      adapter = ArrayAdapter(this@SettingsActivity, android.R.layout.simple_spinner_dropdown_item, names)
+                      setSelection(maxOf(0, codes.indexOf(p.trDst)))
+                      onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                          override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                              p.trDst = codes[pos]
+                          }
+
+                          override fun onNothingSelected(parent: AdapterView<*>?) {}
+                      }
+                  })
+
+                  // 7. Horrons AI
+                  root.addView(title("Horrons AI"))
+                  root.addView(note("Помощник в клавиатуре: исправляет текст, делает короче, вежливее или отвечает на вопрос. Встроенного бесплатного ИИ нет: нужен ключ API любого ИИ-сервиса. Текст из поля отправляется выбранному сервису. В полях паролей помощник отключён. Ключ хранится только на этом телефоне."))
+                  root.addView(note("Для Anthropic оставь адрес по умолчанию. Для других сервисов впиши их адрес вида https://…/v1 (формат OpenAI) и название модели. Если сервис недоступен в твоей стране, нужен VPN."))
+                  fun edit(label: String, value: String, secret: Boolean, onChange: (String) -> Unit) {
+                      root.addView(TextView(this).apply {
+                          text = label
+                          setPadding(0, 10.dp(), 0, 0)
+                      })
+                      root.addView(EditText(this).apply {
+                          setText(value)
+                          inputType = InputType.TYPE_CLASS_TEXT or
+                                  (if (secret) InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_TEXT_VARIATION_URI)
+                          setSingleLine()
+                          addTextChangedListener(object : TextWatcher {
+                              override fun afterTextChanged(s: Editable?) {
+                                  onChange(s?.toString() ?: "")
+                              }
+
+                              override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                              override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                          })
+                      })
+                  }
+                  edit("Адрес сервера", p.aiUrl, false) { p.aiUrl = it }
+                  edit("Ключ API", p.aiKey, true) { p.aiKey = it }
+                  edit("Модель", p.aiModel, false) { p.aiModel = it }
+                  root.addView(note("Как пользоваться: напиши текст в любом поле, нажми «✨ Horrons AI» и выбери действие. «Спросить» отправит написанное как вопрос и заменит его ответом."))
+              }
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Themes.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Themes.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.graphics.Color
+
+          private fun c(s: String): Int = Color.parseColor(s)
+
+          class KbTheme(
+              val name: String,
+              val bg: Int,
+              val key: Int,
+              val special: Int,
+              val text: Int,
+              val hint: Int,
+              val accent: Int,
+              val accentText: Int,
+              val pressed: Int,
+              val preview: Int
+          )
+
+          object Themes {
+              val all: List<KbTheme> = listOf(
+                  KbTheme("Тёмная", c("#1C1C1F"), c("#3B3B40"), c("#2B2B2F"), c("#F2F2F4"), c("#8E8E96"), c("#FFD27F"), c("#1A0F05"), c("#5A5A62"), c("#5A5A62")),
+                  KbTheme("Светлая", c("#D9DCE1"), c("#FFFFFF"), c("#B9BEC7"), c("#1B1B1F"), c("#6B6F78"), c("#FFCC33"), c("#1B1B1F"), c("#C5C9D1"), c("#FFFFFF")),
+                  KbTheme("Ночь (AMOLED)", c("#000000"), c("#1A1A1A"), c("#0F0F0F"), c("#FFFFFF"), c("#777777"), c("#3DDC84"), c("#001A0A"), c("#333333"), c("#2A2A2A")),
+                  KbTheme("Синяя", c("#0F1B33"), c("#22355C"), c("#18284A"), c("#EAF1FF"), c("#8FA6D6"), c("#4A8AFF"), c("#FFFFFF"), c("#3A5188"), c("#3A5188")),
+                  KbTheme("Зелёная", c("#0E2217"), c("#1E4430"), c("#143222"), c("#E8FFF1"), c("#8FC9A6"), c("#3DDC84"), c("#04210F"), c("#2F6A4A"), c("#2F6A4A")),
+                  KbTheme("Рогатый (красная)", c("#1A0808"), c("#3A1412"), c("#2A0D0C"), c("#FFE9E6"), c("#C98F89"), c("#E5484D"), c("#FFFFFF"), c("#6A2622"), c("#6A2622"))
+              )
+
+              fun get(i: Int): KbTheme = all[i.coerceIn(0, all.lastIndex)]
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Tr.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Tr.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.nl.translate.Translation
+          import com.google.mlkit.nl.translate.Translator
+          import com.google.mlkit.nl.translate.TranslatorOptions
+
+          /** Перевод на телефоне через Google ML Kit. Языковые модели скачиваются при первом использовании. */
+          object Tr {
+              private val cache = HashMap<String, Translator>()
+
+              /** Грубо определяет язык: кириллица (ru или uk) либо латиница (en). */
+              fun detect(text: String): String {
+                  var cyr = 0
+                  var lat = 0
+                  var uk = false
+                  for (ch in text) {
+                      if ("іїєґІЇЄҐ".indexOf(ch) >= 0) {
+                          cyr++
+                          uk = true
+                      } else if (ch in 'а'..'я' || ch in 'А'..'Я' || ch == 'ё' || ch == 'Ё') {
+                          cyr++
+                      } else if (ch in 'a'..'z' || ch in 'A'..'Z') {
+                          lat++
+                      }
+                  }
+                  return if (cyr > lat) (if (uk) "uk" else "ru") else "en"
+              }
+
+              /** Колбэк вызывается в главном потоке: (результат, ошибка). */
+              fun translate(text: String, srcPref: String, dst: String, cb: (String?, String?) -> Unit) {
+                  val src = if (srcPref == "auto") detect(text) else srcPref
+                  if (src == dst) {
+                      cb(null, "Язык текста и язык перевода совпадают. Нажмите «→ ${dst.uppercase()}» и выберите другой.")
+                      return
+                  }
+                  try {
+                      val key = "$src>$dst"
+                      val tr = cache.getOrPut(key) {
+                          Translation.getClient(
+                              TranslatorOptions.Builder()
+                                  .setSourceLanguage(src)
+                                  .setTargetLanguage(dst)
+                                  .build()
+                          )
+                      }
+                      tr.downloadModelIfNeeded(DownloadConditions.Builder().build())
+                          .addOnSuccessListener {
+                              tr.translate(text)
+                                  .addOnSuccessListener { result -> cb(result, null) }
+                                  .addOnFailureListener { cb(null, "Не удалось перевести") }
+                          }
+                          .addOnFailureListener {
+                              cb(null, "Не удалось скачать язык. Проверьте интернет.")
+                          }
+                  } catch (e: Exception) {
+                      cb(null, "Перевод недоступен на этом телефоне")
+                  }
+              }
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_launcher.xml')"
+          cat > 'app/src/main/res/drawable/ic_launcher.xml' <<'HRN_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="96dp"
+              android:height="96dp"
+              android:viewportWidth="96"
+              android:viewportHeight="96">
+              <path
+                  android:fillColor="#1C1C1F"
+                  android:pathData="M16,0h64a16,16 0 0 1 16,16v64a16,16 0 0 1 -16,16h-64a16,16 0 0 1 -16,-16v-64a16,16 0 0 1 16,-16z" />
+              <path
+                  android:fillColor="#FFD27F"
+                  android:pathData="M14,30h12v12h-12z M32,30h12v12h-12z M50,30h12v12h-12z M68,30h12v12h-12z M14,48h12v12h-12z M32,48h12v12h-12z M50,48h12v12h-12z M68,48h12v12h-12z M26,66h44v12h-44z" />
+          </vector>
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'HRN_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Horrons Клавиатура</string>
+              <string name="ime_name">Horrons Клавиатура</string>
+          </resources>
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/method.xml')"
+          cat > 'app/src/main/res/xml/method.xml' <<'HRN_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android"
+              android:settingsActivity="ru.horrons.keyboard.SettingsActivity" />
+          HRN_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'HRN_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'HRN_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
           android.nonTransitiveRClass=true
           kotlin.code.style=official
           HRN_EOF
