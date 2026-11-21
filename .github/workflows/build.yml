@@ -71,9 +71,16 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+              </queries>
 
               <application
-                  android:allowBackup="true"
+                  android:allowBackup="false"
                   android:icon="@drawable/ic_launcher"
                   android:label="@string/app_name"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
@@ -86,6 +93,12 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <activity
+                      android:name=".MicActivity"
+                      android:exported="false"
+                      android:excludeFromRecents="true"
+                      android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
                   <service
                       android:name=".KeyboardService"
@@ -116,11 +129,11 @@ jobs:
           /**
            * Запрос к ИИ. Если адрес содержит anthropic.com, используется формат Anthropic Messages,
            * иначе формат OpenAI (адрес + /chat/completions), который понимают многие сервисы.
+           * Сервис и модель по умолчанию определяются по ключу. При перегрузке сервера запрос повторяется.
            */
           object Ai {
               private val main = Handler(Looper.getMainLooper())
 
-              /** Настройки сервиса: адрес и модель по умолчанию. */
               private class Svc(val base: String, val model: String)
 
               /** Определяет сервис по префиксу ключа. Если адрес или модель заданы вручную, они главнее. */
@@ -129,14 +142,55 @@ jobs:
                       key.startsWith("sk-ant-") -> Svc("https://api.anthropic.com", "claude-haiku-5-5")
                       key.startsWith("sk-or-") -> Svc("https://openrouter.ai/api/v1", "openai/gpt-4o-mini")
                       key.startsWith("gsk_") -> Svc("https://api.groq.com/openai/v1", "llama-3.3-70b-versatile")
-                      key.startsWith("AIza") || key.startsWith("AQ.") -> Svc("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-latest")
+                      key.startsWith("AIza") || key.startsWith("AQ.") ->
+                          Svc("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-latest")
                       key.startsWith("xai-") -> Svc("https://api.x.ai/v1", "grok-3-mini")
-                      key.startsWith("sk-") -> Svc("https://api.openai.com/v1", "gpt-4o-mini")
                       else -> Svc("https://api.openai.com/v1", "gpt-4o-mini")
                   }
                   val u = url.trim()
                   val m = model.trim()
                   return Svc(if (u.isEmpty() || u.equals("auto", true)) d.base else u, if (m.isEmpty()) d.model else m)
+              }
+
+              private class Reply(val code: Int, val text: String)
+
+              private fun post(
+                  base: String, anthropic: Boolean, key: String, model: String,
+                  system: String, user: String
+              ): Reply {
+                  val url = URL(if (anthropic) "$base/v1/messages" else "$base/chat/completions")
+                  val c = url.openConnection() as HttpURLConnection
+                  try {
+                      c.requestMethod = "POST"
+                      c.connectTimeout = 15000
+                      c.readTimeout = 60000
+                      c.doOutput = true
+                      c.setRequestProperty("Content-Type", "application/json")
+                      val body = JSONObject()
+                      body.put("model", model)
+                      body.put("max_tokens", 1500)
+                      if (anthropic) {
+                          c.setRequestProperty("x-api-key", key)
+                          c.setRequestProperty("anthropic-version", "2023-06-01")
+                          body.put("system", system)
+                          body.put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", user)))
+                      } else {
+                          c.setRequestProperty("Authorization", "Bearer $key")
+                          body.put(
+                              "messages",
+                              JSONArray()
+                                  .put(JSONObject().put("role", "system").put("content", system))
+                                  .put(JSONObject().put("role", "user").put("content", user))
+                          )
+                      }
+                      c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                      val code = c.responseCode
+                      val stream = if (code in 200..299) c.inputStream else c.errorStream
+                      val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                      return Reply(code, text)
+                  } finally {
+                      c.disconnect()
+                  }
               }
 
               /** Колбэк вызывается в главном потоке: (ответ, ошибка). */
@@ -157,41 +211,18 @@ jobs:
                           val svc = resolve(baseUrl, k, model)
                           val base = svc.base.trim().trimEnd('/')
                           val anthropic = base.contains("anthropic.com")
-                          val url = URL(if (anthropic) "$base/v1/messages" else "$base/chat/completions")
-                          val c = url.openConnection() as HttpURLConnection
-                          c.requestMethod = "POST"
-                          c.connectTimeout = 15000
-                          c.readTimeout = 60000
-                          c.doOutput = true
-                          c.setRequestProperty("Content-Type", "application/json")
-
-                          val body = JSONObject()
-                          body.put("model", svc.model)
-                          body.put("max_tokens", 1024)
-                          if (anthropic) {
-                              c.setRequestProperty("x-api-key", k)
-                              c.setRequestProperty("anthropic-version", "2023-06-01")
-                              body.put("system", system)
-                              body.put(
-                                  "messages",
-                                  JSONArray().put(JSONObject().put("role", "user").put("content", user))
-                              )
-                          } else {
-                              c.setRequestProperty("Authorization", "Bearer " + k)
-                              body.put(
-                                  "messages",
-                                  JSONArray()
-                                      .put(JSONObject().put("role", "system").put("content", system))
-                                      .put(JSONObject().put("role", "user").put("content", user))
-                              )
+                          var attempt = 0
+                          var reply = post(base, anthropic, k, svc.model, system, user)
+                          // перегрузка сервера: пробуем ещё до двух раз
+                          while (attempt < 2 && (reply.code == 429 || reply.code == 500 || reply.code == 502 ||
+                                      reply.code == 503 || reply.code == 504)
+                          ) {
+                              attempt++
+                              Thread.sleep(1500L * attempt)
+                              reply = post(base, anthropic, k, svc.model, system, user)
                           }
-                          c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-
-                          val code = c.responseCode
-                          val stream = if (code in 200..299) c.inputStream else c.errorStream
-                          val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-                          if (code in 200..299) {
-                              val j = JSONObject(text)
+                          if (reply.code in 200..299) {
+                              val j = JSONObject(reply.text)
                               val out: String
                               if (anthropic) {
                                   val arr = j.getJSONArray("content")
@@ -207,10 +238,18 @@ jobs:
                               }
                               if (out.isEmpty()) err = "Пустой ответ" else res = out
                           } else {
-                              err = explain(code, text)
+                              err = explain(reply.code, reply.text)
                           }
+                      } catch (e: java.net.UnknownHostException) {
+                          err = "Нет интернета или сервис заблокирован (не найден адрес). Проверьте сеть или включите VPN."
+                      } catch (e: java.net.SocketTimeoutException) {
+                          err = "Сервер не отвечает (таймаут). Возможно, сервис заблокирован: нужен VPN."
+                      } catch (e: javax.net.ssl.SSLException) {
+                          err = "Ошибка защищённого соединения. Проверьте сеть или VPN."
+                      } catch (e: org.json.JSONException) {
+                          err = "Сервер вернул непонятный ответ. Проверьте адрес и модель."
                       } catch (e: Exception) {
-                          err = "Нет связи с сервером"
+                          err = "Сбой: " + e.javaClass.simpleName + " " + (e.message ?: "").take(60)
                       }
                       val fr = res
                       val fe = err
@@ -225,30 +264,281 @@ jobs:
                   } catch (e: Exception) {
                   }
                   val base = when (code) {
+                      400 -> "Запрос отклонён (400). Возможно, сервис не поддерживает ваш регион: включите VPN."
                       401 -> "Ключ не подошёл (401)."
                       403 -> "Доступ закрыт (403). Возможно, сервис недоступен в вашей стране: нужен VPN."
                       404 -> "Не найдено (404). Проверьте адрес сервера и название модели (можно очистить оба поля)."
                       429 -> "Слишком много запросов (429). Подождите."
+                      503 -> "Сервер перегружен (503). Попробуйте позже или другую модель."
                       else -> "Ошибка сервера ($code)."
                   }
                   return if (msg.isNotEmpty()) base + " " + msg.take(80) else base
               }
           }
           HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Dict.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Dict.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.os.Handler
+          import android.os.Looper
+
+          /**
+           * Словари: небольшой встроенный список частых слов и личный словарь, который пополняется
+           * тем, что вы печатаете (только на телефоне, в полях паролей не работает).
+           */
+          object Dict {
+              private val builtinText = mapOf(
+                  "ru" to "и в не на я что он с как а то все она так его но да ты к у же вы за бы по только ее мне было вот от меня еще нет о из ему теперь когда даже ну вдруг ли если уже или ни быть был него до вас нибудь опять уж вам сказал ведь там потом себя ничего ей может они тут где есть надо ней для мы тебя их чем была сам чтоб без будто чего раз тоже себе под будет ж тогда кто этот того потому этого какой совсем ним здесь этом один почти мой тем чтобы нее сейчас были куда зачем всех никогда можно при наконец два об другой хоть после над больше тот через эти нас про всего них какая много разве три эту моя впрочем хорошо свою этой перед иногда лучше чуть том нельзя такой им более всегда конечно всю между привет пока здравствуйте спасибо пожалуйста извините добрый день вечер утро ночи дела делаешь можешь могу хочу буду давай сегодня завтра вчера сейчас работа дом друг время человек жизнь рука слово город голова деньги вопрос ответ телефон сообщение письмо картинка сделать сказать говорить знать хотеть идти видеть смотреть думать понять любить жить работать позвони напиши отправь приходи встретимся скоро быстро медленно большой маленький новый старый красивый правда конечно наверное возможно отлично замечательно давайте поговорим",
+                  "en" to "the be to of and a in that have i it for not on with he as you do at this but his by from they we say her she or an will my one all would there their what so up out if about who get which go me when make can like time no just him know take people into year your good some could them see other than then now look only come its over think also back after use two how our work first well way even new want because any these give day most us is are was were been has had did am hello hi hey thanks thank please sorry yes okay ok sure great nice love home friend phone message today tomorrow yesterday tonight morning evening night really very much more where here need should call text send meet soon later never always maybe probably actually already still again going doing coming having being something nothing everything anything someone everyone"
+              )
+
+              private val pairs = mapOf(
+                  "ru" to listOf("как дела", "как ты", "что делаешь", "до свидания", "добрый день", "доброе утро", "добрый вечер", "спасибо большое", "хорошего дня", "я тебя", "не знаю", "я думаю", "я хочу", "давай встретимся", "очень рад"),
+                  "en" to listOf("how are", "are you", "thank you", "see you", "good morning", "good night", "i am", "i will", "i think", "i want", "let me", "talk to", "looking forward", "have a", "see you soon")
+              )
+
+              private val builtin = HashMap<String, List<String>>()
+              private val builtinRank = HashMap<String, HashMap<String, Int>>()
+              private val user = HashMap<String, HashMap<String, Int>>()
+              private val next = HashMap<String, HashMap<String, Int>>()
+              private var sp: SharedPreferences? = null
+              private var loaded = false
+              private val h = Handler(Looper.getMainLooper())
+              private val saveRun = Runnable { save() }
+
+              private const val MAX_WORDS = 6000
+              private const val MAX_PAIRS = 4000
+
+              /** Слово из личного словаря считается известным, когда встретилось не меньше стольких раз */
+              private const val MIN_USER = 2
+
+              fun init(ctx: Context) {
+                  if (loaded) return
+                  loaded = true
+                  sp = ctx.applicationContext.getSharedPreferences("dict", Context.MODE_PRIVATE)
+                  for ((lang, text) in builtinText) {
+                      val list = text.split(" ").filter { it.isNotEmpty() }.distinct()
+                      builtin[lang] = list
+                      val m = HashMap<String, Int>()
+                      list.forEachIndexed { i, w -> m[w] = i }
+                      builtinRank[lang] = m
+                  }
+                  val s = sp ?: return
+                  for (lang in Layouts.all) {
+                      readMap(s.getString("u_$lang", "") ?: "", user.getOrPut(lang) { HashMap() })
+                      readMap(s.getString("n_$lang", "") ?: "", next.getOrPut(lang) { HashMap() })
+                  }
+              }
+
+              private fun readMap(text: String, into: HashMap<String, Int>) {
+                  for (line in text.split("\n")) {
+                      val t = line.lastIndexOf('\t')
+                      if (t <= 0) continue
+                      val n = line.substring(t + 1).toIntOrNull() ?: continue
+                      into[line.substring(0, t)] = n
+                  }
+              }
+
+              private fun writeMap(m: Map<String, Int>): String {
+                  val sb = StringBuilder()
+                  for ((k, v) in m) sb.append(k).append('\t').append(v).append('\n')
+                  return sb.toString()
+              }
+
+              private fun save() {
+                  val e = sp?.edit() ?: return
+                  for ((lang, m) in user) e.putString("u_$lang", writeMap(m))
+                  for ((lang, m) in next) e.putString("n_$lang", writeMap(m))
+                  e.apply()
+              }
+
+              private fun scheduleSave() {
+                  h.removeCallbacks(saveRun)
+                  h.postDelayed(saveRun, 4000)
+              }
+
+              private fun userMap(lang: String): HashMap<String, Int> = user.getOrPut(lang) { HashMap() }
+              private fun nextMap(lang: String): HashMap<String, Int> = next.getOrPut(lang) { HashMap() }
+
+              fun isWord(w: String): Boolean = w.length in 2..24 && w.all { it.isLetter() || it == '\'' || it == '-' }
+
+              private fun score(lang: String, w: String): Int {
+                  var s = 0
+                  val u = user[lang]?.get(w)
+                  if (u != null && u >= MIN_USER) s += u * 100 + 50
+                  val r = builtinRank[lang]?.get(w)
+                  if (r != null) s += maxOf(1, 400 - r)
+                  return s
+              }
+
+              fun known(lang: String, w: String): Boolean {
+                  val l = w.lowercase()
+                  return (user[lang]?.get(l) ?: 0) >= MIN_USER || builtinRank[lang]?.containsKey(l) == true
+              }
+
+              private fun withCase(w: String, like: String): String =
+                  if (like.isNotEmpty() && like.length > 1 && like.all { it.isUpperCase() }) w.uppercase()
+                  else if (like.isNotEmpty() && like[0].isUpperCase()) w.replaceFirstChar { it.uppercase() }
+                  else w
+
+              /** Варианты продолжения слова по начатым буквам. */
+              fun suggest(lang: String, prefix: String, limit: Int): List<String> {
+                  val p = prefix.lowercase()
+                  if (p.isEmpty()) return emptyList()
+                  val cand = HashSet<String>()
+                  user[lang]?.forEach { (k, v) -> if (v >= MIN_USER && k.length > p.length && k.startsWith(p)) cand.add(k) }
+                  builtin[lang]?.forEach { if (it.length > p.length && it.startsWith(p)) cand.add(it) }
+                  return cand.sortedByDescending { score(lang, it) }.take(limit).map { withCase(it, prefix) }
+              }
+
+              /** Предсказание следующего слова после предыдущего слова. */
+              fun nextWords(lang: String, prev: String, limit: Int): List<String> {
+                  val p = prev.lowercase()
+                  if (p.isEmpty()) return emptyList()
+                  val found = HashMap<String, Int>()
+                  val prefix = "$p "
+                  nextMap(lang).forEach { (k, v) ->
+                      if (v >= MIN_USER && k.startsWith(prefix)) found[k.substring(prefix.length)] = v * 10
+                  }
+                  pairs[lang]?.forEach {
+                      if (it.startsWith(prefix)) {
+                          val w = it.substring(prefix.length)
+                          found[w] = (found[w] ?: 0) + 1
+                      }
+                  }
+                  return found.entries.sortedByDescending { it.value }.take(limit).map { it.key }
+              }
+
+              fun learn(lang: String, word: String) {
+                  val w = word.lowercase()
+                  if (!isWord(w)) return
+                  val m = userMap(lang)
+                  if (m.size >= MAX_WORDS && !m.containsKey(w)) return
+                  m[w] = (m[w] ?: 0) + 1
+                  scheduleSave()
+              }
+
+              fun learnPair(lang: String, prev: String, word: String) {
+                  val a = prev.lowercase()
+                  val b = word.lowercase()
+                  if (!isWord(a) || !isWord(b)) return
+                  val m = nextMap(lang)
+                  val key = "$a $b"
+                  if (m.size >= MAX_PAIRS && !m.containsKey(key)) return
+                  m[key] = (m[key] ?: 0) + 1
+                  scheduleSave()
+              }
+
+              /** Расстояние Дамерау: вставка, удаление, замена, перестановка соседних букв. */
+              private fun dist(a: String, b: String): Int {
+                  val n = a.length
+                  val m = b.length
+                  val d = Array(n + 1) { IntArray(m + 1) }
+                  for (i in 0..n) d[i][0] = i
+                  for (j in 0..m) d[0][j] = j
+                  for (i in 1..n) {
+                      for (j in 1..m) {
+                          val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                          var v = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+                          if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) v = minOf(v, d[i - 2][j - 2] + 1)
+                          d[i][j] = v
+                      }
+                  }
+                  return d[n][m]
+              }
+
+              /** Исправление опечатки: слово из словаря на расстоянии 1, или null, если слово знакомое. */
+              fun correct(lang: String, word: String): String? {
+                  val w = word.lowercase()
+                  if (w.length < 4 || !isWord(w) || known(lang, w)) return null
+                  var best: String? = null
+                  var bs = -1
+                  val all = HashSet<String>()
+                  user[lang]?.forEach { (k, v) -> if (v >= MIN_USER) all.add(k) }
+                  builtin[lang]?.let { all.addAll(it) }
+                  for (c in all) {
+                      if (Math.abs(c.length - w.length) > 1 || c[0] != w[0]) continue
+                      if (dist(w, c) == 1) {
+                          val s = score(lang, c)
+                          if (s > bs) {
+                              bs = s
+                              best = c
+                          }
+                      }
+                  }
+                  return best?.let { withCase(it, word) }
+              }
+
+              // ----- управление личным словарём из настроек -----
+
+              fun userCount(): Int {
+                  var n = 0
+                  for (m in user.values) n += m.size
+                  return n
+              }
+
+              fun add(lang: String, word: String): Boolean {
+                  val w = word.trim().lowercase()
+                  if (!isWord(w)) return false
+                  val m = userMap(lang)
+                  m[w] = (m[w] ?: 0) + 3
+                  save()
+                  return true
+              }
+
+              fun clearUser() {
+                  user.values.forEach { it.clear() }
+                  next.values.forEach { it.clear() }
+                  save()
+              }
+          }
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Emoji.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/Emoji.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          /** Эмодзи по категориям. Иконка категории показывается во вкладках панели. */
+          object Emoji {
+              class Cat(val icon: String, val items: List<String>)
+
+              private fun l(s: String): List<String> = s.split(" ").filter { it.isNotEmpty() }
+
+              val cats: List<Cat> = listOf(
+                  Cat("😀", l("😀 😃 😄 😁 😆 😅 😂 🤣 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😗 😚 😋 😛 😜 🤪 😝 🤗 🤭 🤔 🤨 😐 😑 😶 🙄 😏 😒 😞 😔 😟 😕 🙁 😣 😖 😫 😩 🥺 😢 😭 😤 😠 😡 🤬 🤯 😳 🥵 🥶 😱 😨 😰 😥 😓 🤤 😴 😷 🤒 🤕 🤢 🤮 🥳 😎 🤓 🧐")),
+                  Cat("👍", l("👍 👎 👌 ✌ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝ ✋ 🤚 🖐 🖖 👋 🤝 🙏 👏 🙌 👐 🤲 💪 🦾 ✍ 💅 🤳 👀 👁 👂 👃 👄 🦷 👅 🧠 👶 👦 👧 👨 👩 🧔 👴 👵 🙋 🙆 🙅 🤷 🤦 💁 🙇")),
+                  Cat("🐻", l("🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐷 🐸 🐵 🙈 🙉 🙊 🐔 🐧 🐦 🐤 🦆 🦅 🦉 🦇 🐺 🐗 🐴 🦄 🐝 🐛 🦋 🐌 🐞 🐜 🕷 🐢 🐍 🦎 🐙 🦑 🦀 🐠 🐟 🐬 🐳 🐋 🦈 🌵 🌲 🌳 🌴 🌱 🌿 🍀 🍁 🍂 🌺 🌻 🌹 🌷 🌸 ☀ 🌙 ⭐ ☁ ⛄ 🔥 💧 🌊")),
+                  Cat("🍔", l("🍏 🍎 🍐 🍊 🍋 🍌 🍉 🍇 🍓 🍒 🍑 🥭 🍍 🥥 🥝 🍅 🥑 🍆 🥔 🥕 🌽 🌶 🥒 🥦 🍞 🧀 🍗 🍖 🌭 🍔 🍟 🍕 🌮 🌯 🥗 🍝 🍜 🍲 🍣 🍤 🍦 🍩 🍪 🎂 🍰 🍫 🍬 🍭 ☕ 🍵 🍺 🍻 🥂 🍷 🍸 🍹 🥤")),
+                  Cat("⚽", l("⚽ 🏀 🏈 ⚾ 🎾 🏐 🏉 🎱 🏓 🏸 🥊 🥋 ⛳ 🏹 🎣 🎮 🎯 🎲 🎰 🎳 🎨 🎤 🎧 🎸 🎹 🥁 🎷 🎺 🎬 🏆 🥇 🥈 🥉 🏅 🎖 🎁 🎉 🎊 🎈")),
+                  Cat("🚗", l("🚗 🚕 🚙 🚌 🚎 🏎 🚓 🚑 🚒 🚚 🚜 🚲 🛵 🏍 🚂 🚆 🚇 ✈ 🛫 🛬 🚀 🛸 🚁 ⛵ 🚤 🚢 ⚓ 🏠 🏡 🏢 🏥 🏦 🏨 🏫 ⛪ 🕌 🗼 🗽 🌍 🌎 🌏 🗺 🏔 🌋 🏖 🏝 🌅 🌃 🌉")),
+                  Cat("❤", l("❤ 🧡 💛 💚 💙 💜 🖤 🤍 🤎 💔 ❣ 💕 💞 💓 💗 💖 💘 💝 ✨ ⭐ 🌟 💫 ⚡ 💥 💢 💯 ✅ ❌ ❓ ❗ ⚠ ➕ ➖ ➡ ⬅ ⬆ ⬇ 🔔 🔑 🔒 📱 💻 📷 💡 📌 📎 ✏ 📝 📅 💰 🎵 ☎ ⏰ ⌛"))
+              )
+          }
+          HRN_EOF
           mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/KeyboardService.kt')"
           cat > 'app/src/main/java/ru/horrons/keyboard/KeyboardService.kt' <<'HRN_EOF'
           package ru.horrons.keyboard
 
+          import android.Manifest
           import android.content.ClipboardManager
           import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
           import android.inputmethodservice.InputMethodService
+          import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
           import android.os.SystemClock
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
           import android.text.InputType
           import android.view.KeyEvent
           import android.view.View
           import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputConnection
           import android.view.inputmethod.InputMethodManager
 
           class KeyboardService : InputMethodService() {
@@ -266,9 +556,10 @@ jobs:
 
               private var enterLabel = "↵"
               private var password = false
+              private var curPkg = ""
 
-              // ----- панель инструментов: перевод и Horrons AI -----
-              /** 0 — клавиатура, 1 — перевод, 2 — Horrons AI */
+              // ----- панель инструментов -----
+              /** 0 — клавиатура, 1 — перевод */
               var mode: Int = 0
               var status: String? = null
               var statusErr: Boolean = false
@@ -278,21 +569,45 @@ jobs:
               private val ui = Handler(Looper.getMainLooper())
               private val clearRun = Runnable {
                   status = null
+                  updateSugg()
                   kv?.invalidate()
               }
+
+              // ----- панели: 0 нет, 1 эмодзи, 2 буфер обмена, 3 Horrons AI, 4 текст ответа -----
+              var panel: Int = 0
+              var panelVer: Int = 0
+              private var emojiCat: Int = 0
+              private var aiResult: String = ""
+
+              // ----- подсказки слов -----
+              var sugg: List<String> = emptyList()
+              private var toolsOpen = false
+              private var revertCorr: String? = null
+              private var revertOrig: String = ""
+              private var revertTail: String = ""
 
               private val srcList = listOf("auto", "en", "ru", "uk", "de", "es", "fr", "it", "pt", "tr", "zh", "ja", "ko")
 
               private val sys = mapOf(
                   "fix" to "Ты Horrons AI. Исправь орфографию, пунктуацию и грамматику в тексте пользователя. Сохрани смысл, язык и стиль. Верни только исправленный текст, без пояснений и кавычек.",
+                  "punct" to "Ты Horrons AI. Расставь в тексте пользователя знаки препинания и заглавные буквы. Слова не меняй. Верни только результат, без пояснений и кавычек.",
+                  "rephrase" to "Ты Horrons AI. Перефразируй текст пользователя другими словами, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "formal" to "Ты Horrons AI. Перепиши текст пользователя в деловом, официальном стиле, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "casual" to "Ты Horrons AI. Перепиши текст пользователя простым разговорным стилем, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "friendly" to "Ты Horrons AI. Перепиши текст пользователя тёплым дружелюбным тоном, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "improve" to "Ты Horrons AI. Улучши качество текста пользователя: сделай его яснее, грамотнее и приятнее, сохранив смысл, язык и примерную длину. Верни только результат, без пояснений и кавычек.",
                   "short" to "Ты Horrons AI. Сделай текст пользователя короче, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
                   "polite" to "Ты Horrons AI. Перепиши текст пользователя вежливее и аккуратнее, сохранив смысл и язык. Верни только результат, без пояснений и кавычек.",
+                  "cont" to "Ты Horrons AI. Продолжи текст пользователя естественно, в том же стиле и на том же языке, одним-двумя предложениями. Верни только продолжение, без повтора исходного текста и без кавычек.",
+                  "reply" to "Ты Horrons AI. Текст пользователя это полученное сообщение. Напиши короткий вежливый ответ на него на том же языке. Верни только текст ответа, без пояснений и кавычек.",
+                  "explain" to "Ты Horrons AI. Найди ошибки в тексте пользователя (орфография, пунктуация, грамматика, стиль). Кратко и по пунктам объясни, что неверно и почему, затем дай исправленный вариант. Пиши на языке текста пользователя.",
                   "ask" to "Ты Horrons AI, помощник внутри клавиатуры. Ответь на запрос пользователя кратко и по делу, на языке запроса. Верни только готовый ответ, без вступлений."
               )
 
               // ----- буфер обмена -----
               private var clip: String? = null
               private var clipDismissed: String? = null
+              private val clipHist = ArrayList<String>()
               private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
                   loadClip()
                   clipDismissed = null
@@ -300,18 +615,32 @@ jobs:
               }
 
               private fun loadClip() {
+                  var sensitive = false
                   clip = try {
                       val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                       val d = cm.primaryClip
+                      if (d != null) {
+                          sensitive = d.description?.extras?.getBoolean("android.content.extra.IS_SENSITIVE", false) == true
+                      }
                       if (d != null && d.itemCount > 0) d.getItemAt(0).coerceToText(this)?.toString()?.trim() else null
                   } catch (e: Exception) {
                       null
                   }
+                  val t = clip
+                  if (prefs.clipHistory && !password && !sensitive && !t.isNullOrEmpty() && t.length <= 2000) {
+                      if (clipHist.isEmpty() || clipHist[0] != t) {
+                          clipHist.remove(t)
+                          clipHist.add(0, t)
+                          while (clipHist.size > 25) clipHist.removeAt(clipHist.size - 1)
+                      }
+                  }
+                  if (sensitive) clip = null
               }
 
               override fun onCreate() {
                   super.onCreate()
                   prefs = Prefs(this)
+                  Dict.init(this)
                   try {
                       (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).addPrimaryClipChangedListener(clipListener)
                   } catch (e: Exception) {
@@ -320,6 +649,7 @@ jobs:
               }
 
               override fun onDestroy() {
+                  stopVoice()
                   try {
                       (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).removePrimaryClipChangedListener(clipListener)
                   } catch (e: Exception) {
@@ -335,6 +665,11 @@ jobs:
                   return v
               }
 
+              override fun onFinishInputView(finishingInput: Boolean) {
+                  stopVoice()
+                  super.onFinishInputView(finishingInput)
+              }
+
               override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
                   super.onStartInputView(info, restarting)
                   val cls = info.inputType and InputType.TYPE_MASK_CLASS
@@ -348,6 +683,11 @@ jobs:
 
                   val langs = prefs.langs.ifEmpty { listOf("ru") }
                   if (lang !in langs) lang = langs[0]
+                  curPkg = info.packageName ?: ""
+                  if (prefs.perAppLang && !password && curPkg.isNotEmpty()) {
+                      val saved = prefs.appLang(curPkg)
+                      if (saved != null && saved in langs) lang = saved
+                  }
                   if (password && "en" in langs) lang = "en"
 
                   symbols = numeric
@@ -355,10 +695,15 @@ jobs:
                   shift = 0
                   loadClip()
 
-                  // сбрасываем панель инструментов и устаревшие запросы
+                  // сбрасываем панели и устаревшие запросы
                   mode = 0
+                  panel = 0
+                  panelVer++
+                  toolsOpen = false
+                  revertCorr = null
                   token++
                   busy = false
+                  stopVoice()
                   undoText = null
                   ui.removeCallbacks(clearRun)
                   status = null
@@ -371,6 +716,7 @@ jobs:
                       else -> "↵"
                   }
                   updateShift()
+                  updateSugg()
                   kv?.refresh()
               }
 
@@ -382,7 +728,8 @@ jobs:
                   super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
                   val before = shift
                   updateShift()
-                  if (before != shift) kv?.refresh()
+                  updateSugg()
+                  if (before != shift) kv?.refresh() else kv?.invalidate()
               }
 
               /** Строки раскладки для текущего состояния. */
@@ -406,9 +753,95 @@ jobs:
                   ) 1 else 0
               }
 
+              /** Общее действие после любого изменения текста. */
+              private fun afterEdit() {
+                  val before = shift
+                  updateShift()
+                  updateSugg()
+                  if (before != shift) kv?.refresh() else kv?.invalidate()
+              }
+
+              // ================= подсказки слов =================
+
+              private fun prevWord(b: String, j: Int): String {
+                  if (j < 2 || b[j - 1] != ' ') return ""
+                  var k = j - 1
+                  while (k > 0 && b[k - 1].isLetter()) k--
+                  return b.substring(k, j - 1)
+              }
+
+              private fun updateSugg() {
+                  var out: List<String> = emptyList()
+                  val ic = currentInputConnection
+                  if (ic != null && prefs.suggest && !password && !symbols && mode == 0 && panel == 0 && status == null) {
+                      val b = ic.getTextBeforeCursor(40, 0)?.toString() ?: ""
+                      var j = b.length
+                      while (j > 0 && (b[j - 1].isLetter() || b[j - 1] == '\'')) j--
+                      val cur = b.substring(j)
+                      out = if (cur.isNotEmpty()) {
+                          Dict.suggest(lang, cur, 3)
+                      } else if (b.endsWith(" ")) {
+                          Dict.nextWords(lang, prevWord(b, j), 3)
+                      } else {
+                          emptyList()
+                      }
+                  }
+                  sugg = out
+              }
+
+              private fun pickSuggestion(i: Int) {
+                  val s = sugg.getOrNull(i) ?: return
+                  val ic = currentInputConnection ?: return
+                  val b = ic.getTextBeforeCursor(40, 0)?.toString() ?: ""
+                  var j = b.length
+                  while (j > 0 && (b[j - 1].isLetter() || b[j - 1] == '\'')) j--
+                  val cur = b.substring(j)
+                  if (prefs.learn && !password) {
+                      Dict.learn(lang, s)
+                      Dict.learnPair(lang, prevWord(b, j), s)
+                  }
+                  if (cur.isNotEmpty()) ic.deleteSurroundingText(cur.length, 0)
+                  ic.commitText("$s ", 1)
+                  revertCorr = null
+                  afterEdit()
+              }
+
+              private fun isBreak(c: Char): Boolean = !c.isLetterOrDigit() && c != '\'' && c != '-' && c != '_'
+
+              /** Вызывается при вводе пробела или знака после слова: обучение и автоисправление. Возвращает true, если ввод уже сделан. */
+              private fun wordBreak(ic: InputConnection, text: String): Boolean {
+                  if (!prefs.learn && !prefs.autoCorrect) return false
+                  val b = ic.getTextBeforeCursor(40, 0)?.toString() ?: return false
+                  var i = b.length
+                  while (i > 0 && (b[i - 1].isLetter() || b[i - 1] == '\'')) i--
+                  val word = b.substring(i)
+                  if (word.isEmpty()) return false
+                  val prev = prevWord(b, i)
+                  var fixed: String? = null
+                  if (prefs.autoCorrect) fixed = Dict.correct(lang, word)
+                  if (fixed != null) {
+                      ic.deleteSurroundingText(word.length, 0)
+                      ic.commitText(fixed + text, 1)
+                      revertCorr = fixed
+                      revertOrig = word
+                      revertTail = text
+                      if (prefs.learn) Dict.learnPair(lang, prev, fixed)
+                      return true
+                  }
+                  if (prefs.learn) {
+                      Dict.learn(lang, word)
+                      Dict.learnPair(lang, prev, word)
+                  }
+                  return false
+              }
+
+              // ================= ввод =================
+
               fun type(text: String) {
                   val ic = currentInputConnection
                   var done = false
+                  revertCorr = null
+                  toolsOpen = false
                   if (ic != null && !password && ic.getSelectedText(0).isNullOrEmpty()) {
                       if (text == " " && prefs.dblSpace) {
                           // два пробела подряд после слова → точка и пробел
@@ -427,30 +860,41 @@ jobs:
                               done = true
                           }
                       }
+                      if (!done && text.length == 1 && isBreak(text[0])) done = wordBreak(ic, text)
                   }
                   if (!done) ic?.commitText(text, 1)
-                  val before = shift
                   if (shift == 1) shift = 0
-                  updateShift()
-                  if (before != shift) kv?.refresh()
+                  afterEdit()
               }
 
               fun backspace() {
                   val ic = currentInputConnection ?: return
+                  val rc = revertCorr
+                  if (rc != null) {
+                      // сразу после автоисправления Backspace возвращает слово как было
+                      ic.deleteSurroundingText(rc.length + revertTail.length, 0)
+                      ic.commitText(revertOrig + revertTail, 1)
+                      if (prefs.learn) {
+                          Dict.learn(lang, revertOrig)
+                          Dict.learn(lang, revertOrig)
+                      }
+                      revertCorr = null
+                      afterEdit()
+                      return
+                  }
                   val sel = ic.getSelectedText(0)
                   if (sel != null && sel.isNotEmpty()) {
                       ic.commitText("", 1)
                   } else {
                       sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
                   }
-                  val before = shift
-                  updateShift()
-                  if (before != shift) kv?.refresh()
+                  afterEdit()
               }
 
               /** Удаляет слово слева от курсора (или выделенный текст). */
               fun deleteWord() {
                   val ic = currentInputConnection ?: return
+                  revertCorr = null
                   val sel = ic.getSelectedText(0)
                   if (sel != null && sel.isNotEmpty()) {
                       ic.commitText("", 1)
@@ -465,9 +909,7 @@ jobs:
                           ic.deleteSurroundingText(maxOf(1, b.length - i), 0)
                       }
                   }
-                  val before = shift
-                  updateShift()
-                  if (before != shift) kv?.refresh()
+                  afterEdit()
               }
 
               /** Сдвигает курсор: -1 влево, 1 вправо. */
@@ -478,6 +920,7 @@ jobs:
               fun enter() {
                   val ei = currentInputEditorInfo
                   val ic = currentInputConnection ?: return
+                  revertCorr = null
                   if (ei == null) {
                       sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
                       return
@@ -509,6 +952,7 @@ jobs:
                   symbols = !symbols
                   page = 0
                   if (symbols) shift = 0 else updateShift()
+                  updateSugg()
                   kv?.refresh()
               }
 
@@ -528,9 +972,11 @@ jobs:
                   }
                   val i = langs.indexOf(lang).coerceAtLeast(0)
                   lang = langs[((i + dir) % langs.size + langs.size) % langs.size]
+                  if (prefs.perAppLang && !password && curPkg.isNotEmpty()) prefs.setAppLang(curPkg, lang)
                   symbols = false
                   page = 0
                   updateShift()
+                  updateSugg()
                   kv?.refresh()
               }
 
@@ -539,9 +985,152 @@ jobs:
                   imm.showInputMethodPicker()
               }
 
+              // ================= панели =================
+
+              fun setPanel(p: Int) {
+                  panel = p
+                  panelVer++
+                  if (p != 0) mode = 0
+                  updateSugg()
+                  kv?.invalidate()
+              }
+
+              private fun panelTitle(): String = when (panel) {
+                  1 -> "Эмодзи"
+                  2 -> "Буфер обмена"
+                  3 -> "Horrons AI"
+                  else -> "Ответ Horrons AI"
+              }
+
+              fun panelCols(): Int = when (panel) {
+                  1 -> 8
+                  3 -> 3
+                  else -> 1
+              }
+
+              /** Если это панель с текстом, возвращает текст. */
+              fun panelText(): String? = if (panel == 4) aiResult else null
+
+              fun panelCells(): List<Cell> {
+                  val out = ArrayList<Cell>()
+                  when (panel) {
+                      1 -> {
+                          val items = if (emojiCat < 0) {
+                              prefs.recentEmoji.split(" ").filter { it.isNotEmpty() }
+                          } else {
+                              Emoji.cats[emojiCat.coerceIn(0, Emoji.cats.lastIndex)].items
+                          }
+                          if (items.isEmpty()) out.add(Cell("", "Здесь появятся недавние эмодзи", 3))
+                          for (e in items) out.add(Cell("e:$e", e, 2))
+                      }
+                      2 -> {
+                          if (clipHist.isEmpty()) {
+                              out.add(Cell("", "Буфер пуст. Скопируйте текст, и он появится здесь.", 3))
+                          }
+                          clipHist.forEachIndexed { i, t ->
+                              out.add(Cell("h:$i", t.replace('\n', ' ').take(120), 3))
+                          }
+                      }
+                      3 -> {
+                          out.add(Cell("ai:fix", "Исправить"))
+                          out.add(Cell("ai:punct", "Знаки препинания"))
+                          out.add(Cell("ai:improve", "Улучшить текст"))
+                          out.add(Cell("ai:rephrase", "Перефразировать"))
+                          out.add(Cell("ai:short", "Короче"))
+                          out.add(Cell("ai:polite", "Вежливее"))
+                          out.add(Cell("ai:formal", "Деловой стиль"))
+                          out.add(Cell("ai:casual", "Простой стиль"))
+                          out.add(Cell("ai:friendly", "Дружелюбный"))
+                          out.add(Cell("ai:cont", "Продолжить"))
+                          out.add(Cell("ai:reply", "Ответ на сообщение"))
+                          out.add(Cell("ai:explain", "Объяснить ошибки"))
+                          out.add(Cell("ai:ask", "Спросить ИИ", 1))
+                          if (undoText != null) out.add(Cell("undo", "↩ Вернуть", 1))
+                      }
+                  }
+                  return out
+              }
+
+              fun panelTabs(): List<Cell> {
+                  val out = ArrayList<Cell>()
+                  when (panel) {
+                      1 -> {
+                          out.add(Cell("abc", "ABC"))
+                          out.add(Cell("cat:-1", "🕘", if (emojiCat < 0) 1 else 0))
+                          Emoji.cats.forEachIndexed { i, c -> out.add(Cell("cat:$i", c.icon, if (emojiCat == i) 1 else 0)) }
+                          out.add(Cell("clips", "📋"))
+                          out.add(Cell("bs", "⌫"))
+                      }
+                      2 -> {
+                          out.add(Cell("abc", "ABC"))
+                          out.add(Cell("emoji", "😀"))
+                          out.add(Cell("hclear", "🗑 Очистить"))
+                          out.add(Cell("bs", "⌫"))
+                      }
+                      3 -> {
+                          out.add(Cell("abc", "ABC"))
+                      }
+                      4 -> {
+                          out.add(Cell("ai", "← Назад"))
+                          out.add(Cell("insert", "Вставить", 1))
+                          out.add(Cell("abc", "ABC"))
+                      }
+                  }
+                  return out
+              }
+
+              fun onCell(id: String) {
+                  if (id.isEmpty()) return
+                  when {
+                      id == "abc" -> setPanel(0)
+                      id == "bs" -> backspace()
+                      id == "emoji" -> setPanel(1)
+                      id == "clips" -> setPanel(2)
+                      id == "ai" -> setPanel(3)
+                      id == "undo" -> {
+                          doUndo()
+                          setPanel(0)
+                      }
+                      id == "hclear" -> {
+                          clipHist.clear()
+                          clipDismissed = clip
+                          kv?.invalidate()
+                      }
+                      id == "insert" -> {
+                          currentInputConnection?.commitText(aiResult, 1)
+                          setPanel(0)
+                          afterEdit()
+                      }
+                      id.startsWith("cat:") -> {
+                          emojiCat = id.substring(4).toIntOrNull() ?: 0
+                          panelVer++
+                          kv?.invalidate()
+                      }
+                      id.startsWith("e:") -> insertEmoji(id.substring(2))
+                      id.startsWith("h:") -> {
+                          val i = id.substring(2).toIntOrNull() ?: -1
+                          val t = clipHist.getOrNull(i)
+                          if (t != null) {
+                              currentInputConnection?.commitText(t, 1)
+                              setPanel(0)
+                              afterEdit()
+                          }
+                      }
+                      id.startsWith("ai:") -> doAi(id.substring(3))
+                  }
+              }
+
+              private fun insertEmoji(e: String) {
+                  currentInputConnection?.commitText(e, 1)
+                  val r = prefs.recentEmoji.split(" ").filter { it.isNotEmpty() && it != e }.toMutableList()
+                  r.add(0, e)
+                  while (r.size > 32) r.removeAt(r.size - 1)
+                  prefs.recentEmoji = r.joinToString(" ")
+              }
+
               // ================= панель инструментов =================
 
-              /** Кнопки верхней панели в текущем режиме. */
+              /** Кнопки верхней панели. */
               fun toolbar(): List<Chip> {
                   val st = status
                   if (st != null) {
@@ -550,31 +1139,28 @@ jobs:
                           Chip("clear", if (busy) "✕" else "OK")
                       )
                   }
+                  if (panel != 0) {
+                      return listOf(Chip("", panelTitle(), 2), Chip("pclose", "✕"))
+                  }
                   val out = ArrayList<Chip>()
-                  when (mode) {
-                      1 -> {
-                          out.add(Chip("src", if (prefs.trSrc == "auto") "Авто" else prefs.trSrc.uppercase()))
-                          out.add(Chip("dst", "→ " + prefs.trDst.uppercase()))
-                          out.add(Chip("go", "Перевести", 1))
-                          if (undoText != null) out.add(Chip("undo", "↩"))
-                          out.add(Chip("close", "✕"))
-                      }
-                      2 -> {
-                          out.add(Chip("fix", "Исправить"))
-                          out.add(Chip("short", "Короче"))
-                          out.add(Chip("polite", "Вежливо"))
-                          out.add(Chip("ask", "Спросить", 1))
-                          if (undoText != null) out.add(Chip("undo", "↩"))
-                          out.add(Chip("close", "✕"))
-                      }
-                      else -> {
-                          out.add(Chip("tr", "🌐 Перевод"))
-                          out.add(Chip("ai", "✨ Horrons AI"))
-                          val cl = clip
-                          if (prefs.clipSuggest && !password && !cl.isNullOrBlank() && cl != clipDismissed) {
-                              val one = cl.replace('\n', ' ')
-                              out.add(Chip("clip", "📋 " + (if (one.length > 14) one.take(14) + "…" else one)))
-                          }
+                  if (mode == 1) {
+                      out.add(Chip("src", if (prefs.trSrc == "auto") "Авто" else prefs.trSrc.uppercase()))
+                      out.add(Chip("dst", "→ " + prefs.trDst.uppercase()))
+                      out.add(Chip("go", "Перевести", 1))
+                      if (undoText != null) out.add(Chip("undo", "↩"))
+                      out.add(Chip("close", "✕"))
+                  } else if (!toolsOpen && sugg.isNotEmpty()) {
+                      out.add(Chip("tools", "⋯"))
+                      sugg.forEachIndexed { i, w -> out.add(Chip("s$i", w)) }
+                  } else {
+                      out.add(Chip("tr", "🌐 Перевод"))
+                      if (prefs.aiOn) out.add(Chip("ai", "✨ AI"))
+                      out.add(Chip("emoji", "😀"))
+                      out.add(Chip("mic", "🎤"))
+                      val cl = clip
+                      if (prefs.clipSuggest && !password && !cl.isNullOrBlank() && cl != clipDismissed) {
+                          val one = cl.replace('\n', ' ')
+                          out.add(Chip("clip", "📋 " + (if (one.length > 10) one.take(10) + "…" else one)))
                       }
                   }
                   return out
@@ -588,16 +1174,24 @@ jobs:
                           kv?.invalidate()
                       }
                       "ai" -> {
-                          mode = 2
+                          if (!prefs.aiOn) setStatus("Horrons AI выключен в настройках приложения", true, 4000) else setPanel(3)
+                      }
+                      "emoji" -> setPanel(1)
+                      "mic" -> startVoice()
+                      "tools" -> {
+                          toolsOpen = true
                           kv?.invalidate()
                       }
+                      "pclose" -> setPanel(0)
                       "close" -> {
                           mode = 0
                           setStatus(null)
+                          updateSugg()
                       }
                       "clear" -> {
                           token++
                           busy = false
+                          stopVoice()
                           setStatus(null)
                       }
                       "src" -> {
@@ -616,13 +1210,14 @@ jobs:
                           if (!t.isNullOrEmpty()) {
                               currentInputConnection?.commitText(t, 1)
                               if (prefs.clipClose) clipDismissed = t
-                              updateShift()
-                              kv?.refresh()
+                              afterEdit()
                           }
                       }
                       "go" -> doTranslate()
-                      "fix", "short", "polite", "ask" -> doAi(id)
                       "undo" -> doUndo()
+                      "s0" -> pickSuggestion(0)
+                      "s1" -> pickSuggestion(1)
+                      "s2" -> pickSuggestion(2)
                   }
               }
 
@@ -631,6 +1226,7 @@ jobs:
                   statusErr = err
                   ui.removeCallbacks(clearRun)
                   if (msg != null && !busy && ms > 0) ui.postDelayed(clearRun, ms)
+                  if (msg == null) updateSugg()
                   kv?.invalidate()
               }
 
@@ -658,6 +1254,19 @@ jobs:
                   return true
               }
 
+              /** Дописывает продолжение в позиции курсора. */
+              private fun appendJob(job: Job, result: String): Boolean {
+                  val ic = currentInputConnection ?: return false
+                  val now = readField()
+                  if (now == null || now.orig != job.orig) return false
+                  val needSpace = job.orig.isNotEmpty() && !job.orig.last().isWhitespace() &&
+                          result.isNotEmpty() && !result.first().isWhitespace()
+                  val add = (if (needSpace) " " else "") + result
+                  if (job.sel) ic.commitText(job.orig + add, 1) else ic.commitText(add, 1)
+                  undoText = job.orig
+                  return true
+              }
+
               private fun doUndo() {
                   val u = undoText ?: return
                   val ic = currentInputConnection ?: return
@@ -666,6 +1275,7 @@ jobs:
                   ic.commitText(u, 1)
                   undoText = null
                   setStatus("Возвращено", false, 1500)
+                  afterEdit()
               }
 
               private fun doTranslate() {
@@ -694,6 +1304,10 @@ jobs:
               }
 
               private fun doAi(kind: String) {
+                  if (!prefs.aiOn) {
+                      setStatus("Horrons AI выключен в настройках приложения", true, 4000)
+                      return
+                  }
                   if (password) {
                       setStatus("В полях пароля помощник отключён", true)
                       return
@@ -713,13 +1327,134 @@ jobs:
                       if (my == token) {
                           busy = false
                           if (res != null) {
-                              if (applyJob(job, res)) setStatus("Готово", false, 1200)
-                              else setStatus("Текст изменился, повторите", true)
+                              when (kind) {
+                                  "explain" -> {
+                                      aiResult = res
+                                      setStatus(null)
+                                      setPanel(4)
+                                  }
+                                  "cont" -> {
+                                      if (appendJob(job, res)) {
+                                          setPanel(0)
+                                          setStatus("Готово", false, 1200)
+                                          afterEdit()
+                                      } else {
+                                          setStatus("Текст изменился, повторите", true)
+                                      }
+                                  }
+                                  else -> {
+                                      if (applyJob(job, res)) {
+                                          setPanel(0)
+                                          setStatus("Готово", false, 1200)
+                                          afterEdit()
+                                      } else {
+                                          setStatus("Текст изменился, повторите", true)
+                                      }
+                                  }
+                              }
                           } else {
                               setStatus(err ?: "Ошибка Horrons AI", true, 6000)
                           }
                       }
                   }
+              }
+
+              // ================= голосовой ввод =================
+
+              private var rec: SpeechRecognizer? = null
+
+              private fun stopVoice() {
+                  try {
+                      rec?.cancel()
+                      rec?.destroy()
+                  } catch (e: Exception) {
+                  }
+                  rec = null
+              }
+
+              private fun voiceTag(): String = when (lang) {
+                  "ru" -> "ru-RU"
+                  "uk" -> "uk-UA"
+                  "de" -> "de-DE"
+                  "fr" -> "fr-FR"
+                  "es" -> "es-ES"
+                  "it" -> "it-IT"
+                  "pt" -> "pt-BR"
+                  "pl" -> "pl-PL"
+                  "tr" -> "tr-TR"
+                  "en" -> "en-US"
+                  else -> lang
+              }
+
+              private fun startVoice() {
+                  if (password) {
+                      setStatus("В полях пароля голосовой ввод отключён", true)
+                      return
+                  }
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      try {
+                          val i = Intent(this, MicActivity::class.java)
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                          startActivity(i)
+                      } catch (e: Exception) {
+                      }
+                      setStatus("Разрешите доступ к микрофону и нажмите 🎤 ещё раз", true, 5000)
+                      return
+                  }
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      setStatus("Распознавание речи недоступно на этом телефоне", true, 4000)
+                      return
+                  }
+                  stopVoice()
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  rec = r
+                  val my = ++token
+                  busy = true
+                  setStatus("Говорите…", false)
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onReadyForSpeech(params: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(rmsdB: Float) {}
+                      override fun onBufferReceived(buffer: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(partialResults: Bundle?) {}
+                      override fun onEvent(eventType: Int, params: Bundle?) {}
+
+                      override fun onResults(results: Bundle?) {
+                          if (my != token) return
+                          busy = false
+                          val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                          val text = if (list != null && list.isNotEmpty()) list[0] else ""
+                          if (text.isNotEmpty()) {
+                              val ic = currentInputConnection
+                              val b = ic?.getTextBeforeCursor(1, 0)?.toString() ?: ""
+                              val lead = if (b.isNotEmpty() && !b[0].isWhitespace()) " " else ""
+                              ic?.commitText(lead + text, 1)
+                              setStatus(null)
+                              afterEdit()
+                          } else {
+                              setStatus("Не расслышал, повторите", true)
+                          }
+                      }
+
+                      override fun onError(error: Int) {
+                          if (my != token) return
+                          busy = false
+                          val msg = when (error) {
+                              6, 7 -> "Не расслышал, повторите"
+                              1, 2 -> "Нет сети для распознавания речи"
+                              9 -> "Нет доступа к микрофону"
+                              8 -> "Распознавание занято, повторите"
+                              else -> "Ошибка голосового ввода ($error)"
+                          }
+                          setStatus(msg, true, 4000)
+                      }
+                  })
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, voiceTag())
+                  i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+                  r.startListening(i)
               }
           }
           HRN_EOF
@@ -728,10 +1463,15 @@ jobs:
           package ru.horrons.keyboard
 
           import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
           import android.graphics.Canvas
           import android.graphics.Paint
           import android.graphics.Path
           import android.graphics.RectF
+          import android.text.StaticLayout
+          import android.text.TextPaint
+          import java.io.File
           import android.os.Handler
           import android.os.Looper
           import android.view.HapticFeedbackConstants
@@ -756,6 +1496,23 @@ jobs:
                   strokeJoin = Paint.Join.ROUND
               }
               private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+              private val ltxt = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.LEFT }
+              private val dst = RectF()
+
+              // фон-картинка
+              private var bgBmp: Bitmap? = null
+              private var bgStamp = 0L
+
+              // панели (эмодзи, буфер, ИИ)
+              private var panelTouch = false
+              private var pDownX = 0f
+              private var pDownY = 0f
+              private var pMoved = false
+              private var panelScroll = 0f
+              private var panelScrollStart = 0f
+              private var panelContentH = 0f
+              private var panelVerSeen = -1
+              private var lastY = 0f
 
               private var pressed: Slot? = null
               private var pid = -1
@@ -783,9 +1540,39 @@ jobs:
               private fun keyH(): Float = dp(42f) * svc.prefs.height / 100f
 
               fun refresh() {
+                  loadBg()
                   requestLayout()
                   invalidate()
               }
+
+              override fun onAttachedToWindow() {
+                  super.onAttachedToWindow()
+                  loadBg()
+              }
+
+              private fun loadBg() {
+                  if (!svc.prefs.bgImage) {
+                      bgBmp = null
+                      bgStamp = 0L
+                      return
+                  }
+                  val f = File(context.filesDir, "bg.jpg")
+                  if (!f.exists()) {
+                      bgBmp = null
+                      return
+                  }
+                  if (bgBmp != null && f.lastModified() == bgStamp) return
+                  bgBmp = try {
+                      BitmapFactory.decodeFile(f.path)
+                  } catch (e: Throwable) {
+                      null
+                  }
+                  bgStamp = f.lastModified()
+              }
+
+              /** С фоном-картинкой клавиши делаем чуть прозрачными. */
+              private fun fx(col: Int): Int =
+                  if (bgBmp != null) ((col and 0x00FFFFFF) or (0xD0 shl 24)) else col
 
               // ---------- размеры ----------
 
@@ -870,16 +1657,28 @@ jobs:
               override fun onDraw(c: Canvas) {
                   val t = svc.prefs.themeObj()
                   c.drawColor(t.bg)
+                  val bmp = bgBmp
+                  if (bmp != null) {
+                      val sw = bmp.width.toFloat()
+                      val sh = bmp.height.toFloat()
+                      val sc = maxOf(width / sw, height / sh)
+                      val dw = sw * sc
+                      val dh = sh * sc
+                      dst.set((width - dw) / 2, (height - dh) / 2, (width + dw) / 2, (height + dh) / 2)
+                      c.drawBitmap(bmp, null, dst, null)
+                      paint.color = (t.bg and 0x00FFFFFF) or ((svc.prefs.bgDim.coerceIn(0, 90) * 255 / 100) shl 24)
+                      c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+                  }
 
                   // верхняя панель: кнопки инструментов и «скрыть»
                   for (cs in chipSlots()) {
                       val ch = cs.chip
                       if (ch.kind < 2) {
-                          paint.color = when {
+                          paint.color = fx(when {
                               topChip == ch.id -> t.pressed
                               ch.kind == 1 -> t.accent
                               else -> t.special
-                          }
+                          })
                           c.drawRoundRect(cs.r, dp(10f), dp(10f), paint)
                           txt.color = if (ch.kind == 1) t.accentText else t.text
                       } else {
@@ -899,15 +1698,19 @@ jobs:
 
                   val rad = dp(7f)
                   val kh = keyH()
+                  if (svc.panel != 0) {
+                      drawPanel(c, t)
+                      return
+                  }
                   for (s in slots) {
                       val k = s.key
-                      paint.color = when {
+                      paint.color = fx(when {
                           s === pressed -> t.pressed
                           k.kind == Kind.ENTER -> t.accent
                           k.kind == Kind.SHIFT && svc.shift > 0 -> t.text
                           k.kind == Kind.CHAR || k.kind == Kind.SPACE -> t.key
                           else -> t.special
-                      }
+                      })
                       c.drawRoundRect(s.r, rad, rad, paint)
                       drawLabel(c, s, t, kh)
                   }
@@ -1001,6 +1804,122 @@ jobs:
                   if (lock) c.drawLine(cx - s * 0.45f, cy + s * 1.05f, cx + s * 0.45f, cy + s * 1.05f, stroke)
               }
 
+              // ---------- панели ----------
+
+              private class Geom(
+                  val gridTop: Float, val gridBottom: Float, val tabsTop: Float, val tabsBottom: Float,
+                  val cols: Int, val cellW: Float, val cellH: Float
+              )
+
+              private fun geom(): Geom {
+                  val kh = keyH()
+                  val top = topH + dp(4f)
+                  val bottom = top + rowsCount * (kh + gap) - gap
+                  val tabsTop = bottom - kh
+                  val cols = maxOf(1, svc.panelCols())
+                  val ch = if (cols >= 6) maxOf(kh, dp(40f)) else kh * 0.95f
+                  return Geom(top, tabsTop - gap, tabsTop, bottom, cols, width.toFloat() / cols, ch)
+              }
+
+              private fun drawPanel(c: Canvas, t: KbTheme) {
+                  if (panelVerSeen != svc.panelVer) {
+                      panelVerSeen = svc.panelVer
+                      panelScroll = 0f
+                  }
+                  val g = geom()
+                  val text = svc.panelText()
+                  c.save()
+                  c.clipRect(0f, g.gridTop, width.toFloat(), g.gridBottom)
+                  if (text != null) {
+                      val tp = TextPaint(Paint.ANTI_ALIAS_FLAG)
+                      tp.color = t.text
+                      tp.textSize = dp(15f)
+                      val w = maxOf(50, (width - dp(24f)).toInt())
+                      val sl = StaticLayout.Builder.obtain(text, 0, text.length, tp, w).build()
+                      panelContentH = sl.height + dp(16f)
+                      val maxS = maxOf(0f, panelContentH - (g.gridBottom - g.gridTop))
+                      panelScroll = panelScroll.coerceIn(0f, maxS)
+                      c.translate(dp(12f), g.gridTop + dp(6f) - panelScroll)
+                      sl.draw(c)
+                  } else {
+                      val cells = svc.panelCells()
+                      val rows = (cells.size + g.cols - 1) / g.cols
+                      panelContentH = rows * g.cellH + dp(4f)
+                      val maxS = maxOf(0f, panelContentH - (g.gridBottom - g.gridTop))
+                      panelScroll = panelScroll.coerceIn(0f, maxS)
+                      for (i in cells.indices) {
+                          val cell = cells[i]
+                          val r = i / g.cols
+                          val col = i % g.cols
+                          val x0 = col * g.cellW
+                          val y0 = g.gridTop + r * g.cellH - panelScroll
+                          if (y0 + g.cellH < g.gridTop || y0 > g.gridBottom) continue
+                          if (cell.kind == 2) {
+                              txt.color = t.text
+                              txt.textSize = g.cellH * 0.55f
+                              c.drawText(cell.label, x0 + g.cellW / 2, y0 + g.cellH / 2 - (txt.ascent() + txt.descent()) / 2, txt)
+                          } else {
+                              val rect = RectF(x0 + dp(3f), y0 + dp(2f), x0 + g.cellW - dp(3f), y0 + g.cellH - dp(2f))
+                              paint.color = fx(if (cell.kind == 1) t.accent else t.key)
+                              c.drawRoundRect(rect, dp(8f), dp(8f), paint)
+                              if (cell.kind == 3) {
+                                  ltxt.color = t.text
+                                  ltxt.textSize = dp(14f)
+                                  var label = cell.label
+                                  val n = ltxt.breakText(label, true, rect.width() - dp(20f), null)
+                                  if (n < label.length) label = label.substring(0, maxOf(0, n - 1)) + "…"
+                                  c.drawText(label, rect.left + dp(10f), rect.centerY() - (ltxt.ascent() + ltxt.descent()) / 2, ltxt)
+                              } else {
+                                  txt.color = if (cell.kind == 1) t.accentText else t.text
+                                  txt.textSize = dp(13f)
+                                  val maxW = rect.width() - dp(8f)
+                                  while (txt.measureText(cell.label) > maxW && txt.textSize > dp(9f)) txt.textSize = txt.textSize - dp(0.5f)
+                                  c.drawText(cell.label, rect.centerX(), rect.centerY() - (txt.ascent() + txt.descent()) / 2, txt)
+                              }
+                          }
+                      }
+                  }
+                  c.restore()
+
+                  // нижняя полоса вкладок
+                  val tabs = svc.panelTabs()
+                  if (tabs.isNotEmpty()) {
+                      val tw = width.toFloat() / tabs.size
+                      for (i in tabs.indices) {
+                          val tab = tabs[i]
+                          val rect = RectF(i * tw + dp(2f), g.tabsTop, (i + 1) * tw - dp(2f), g.tabsBottom)
+                          paint.color = fx(if (tab.kind == 1) t.accent else t.special)
+                          c.drawRoundRect(rect, dp(8f), dp(8f), paint)
+                          txt.color = if (tab.kind == 1) t.accentText else t.text
+                          txt.textSize = if (tab.label.length <= 2) dp(17f) else dp(12f)
+                          val maxW = rect.width() - dp(4f)
+                          while (txt.measureText(tab.label) > maxW && txt.textSize > dp(8f)) txt.textSize = txt.textSize - dp(0.5f)
+                          c.drawText(tab.label, rect.centerX(), rect.centerY() - (txt.ascent() + txt.descent()) / 2, txt)
+                      }
+                  }
+              }
+
+              private fun panelTap(x: Float, y: Float) {
+                  val g = geom()
+                  if (y >= g.tabsTop - dp(2f)) {
+                      val tabs = svc.panelTabs()
+                      if (tabs.isEmpty()) return
+                      val i = (x / (width.toFloat() / tabs.size)).toInt().coerceIn(0, tabs.size - 1)
+                      feedback()
+                      svc.onCell(tabs[i].id)
+                      return
+                  }
+                  if (y < g.gridTop || y > g.gridBottom || svc.panelText() != null) return
+                  val cells = svc.panelCells()
+                  val r = ((y - g.gridTop + panelScroll) / g.cellH).toInt()
+                  val col = (x / g.cellW).toInt().coerceIn(0, g.cols - 1)
+                  val idx = r * g.cols + col
+                  if (r >= 0 && idx in cells.indices) {
+                      feedback()
+                      svc.onCell(cells[idx].id)
+                  }
+              }
+
               // ---------- долгое нажатие ----------
 
               /** Что вводится долгим нажатием на клавишу (или null). */
@@ -1069,7 +1988,7 @@ jobs:
               override fun onTouchEvent(e: MotionEvent): Boolean {
                   when (e.actionMasked) {
                       MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                          if (pressed != null || topTap) release(true)
+                          if (pressed != null || topTap || panelTouch) release(true)
                           val i = e.actionIndex
                           pid = e.getPointerId(i)
                           press(e.getX(i), e.getY(i))
@@ -1082,6 +2001,7 @@ jobs:
                           val i = e.actionIndex
                           if (e.getPointerId(i) == pid) {
                               lastX = e.getX(i)
+                              lastY = e.getY(i)
                               release(true)
                               pid = -1
                           }
@@ -1113,10 +2033,19 @@ jobs:
               private fun press(x: Float, y: Float) {
                   longFired = false
                   lastX = x
+                  lastY = y
                   if (y < topH) {
                       topTap = true
                       topChip = topAt(x)
                       invalidate()
+                      return
+                  }
+                  if (svc.panel != 0) {
+                      panelTouch = true
+                      pDownX = x
+                      pDownY = y
+                      pMoved = false
+                      panelScrollStart = panelScroll
                       return
                   }
                   val s = find(x, y) ?: return
@@ -1143,6 +2072,17 @@ jobs:
 
               private fun slide(x: Float, y: Float) {
                   lastX = x
+                  lastY = y
+                  if (panelTouch) {
+                      if (Math.abs(y - pDownY) > dp(8f)) pMoved = true
+                      if (pMoved) {
+                          val g = geom()
+                          val maxS = maxOf(0f, panelContentH - (g.gridBottom - g.gridTop))
+                          panelScroll = (panelScrollStart + (pDownY - y)).coerceIn(0f, maxS)
+                          invalidate()
+                      }
+                      return
+                  }
                   val cur = pressed ?: return
                   if (cur.key.kind == Kind.BACKSPACE) {
                       // свайп влево от backspace удаляет слова
@@ -1212,6 +2152,12 @@ jobs:
                       invalidate()
                       return
                   }
+                  if (panelTouch) {
+                      panelTouch = false
+                      if (commit && !pMoved) panelTap(lastX, lastY)
+                      invalidate()
+                      return
+                  }
                   val spaceSkip = s != null && s.key.kind == Kind.SPACE &&
                           (spaceMode == 2 || (spaceMode == 1 && spaceMoved))
                   if (commit && s != null && !longFired && s.key.kind != Kind.BACKSPACE && !spaceSkip) act(s.key)
@@ -1267,16 +2213,38 @@ jobs:
           )
 
           object Layouts {
-              val names = mapOf(
+              private val baseNames = mapOf(
                   "ru" to "Русский", "en" to "English", "uk" to "Українська",
                   "de" to "Deutsch", "fr" to "Français", "es" to "Español", "it" to "Italiano",
                   "pt" to "Português", "pl" to "Polski", "tr" to "Türkçe"
               )
 
-              /** Все доступные раскладки */
-              val all = listOf("ru", "en", "uk", "de", "fr", "es", "it", "pt", "pl", "tr")
+              private val extraNames = mapOf(
+                  "be" to "Беларуская", "kk" to "Қазақша", "uz" to "Oʻzbekcha", "az" to "Azərbaycanca",
+                  "ka" to "ქართული", "hy" to "Հայերեն", "bg" to "Български", "sr" to "Српски",
+                  "cs" to "Čeština", "sk" to "Slovenčina", "ro" to "Română", "hu" to "Magyar",
+                  "nl" to "Nederlands", "sv" to "Svenska", "no" to "Norsk", "da" to "Dansk",
+                  "fi" to "Suomi", "el" to "Ελληνικά", "he" to "עברית", "ar" to "العربية",
+                  "hr" to "Hrvatski", "lt" to "Lietuvių", "lv" to "Latviešu", "et" to "Eesti",
+                  "id" to "Indonesia", "ms" to "Melayu", "vi" to "Tiếng Việt", "ky" to "Кыргызча", "mn" to "Монгол"
+              )
 
-              val letters = mapOf(
+              val names: Map<String, String> = baseNames + extraNames
+
+              /** Все доступные раскладки */
+              val all: List<String> = listOf("ru", "en", "uk", "de", "fr", "es", "it", "pt", "pl", "tr") +
+                      listOf(
+                          "be", "kk", "uz", "az", "ka", "hy", "bg", "sr", "cs", "sk", "ro", "hu", "nl", "sv", "no", "da",
+                          "fi", "el", "he", "ar", "hr", "lt", "lv", "et", "id", "ms", "vi", "ky", "mn"
+                      )
+
+              /** Языки на кириллице: на клавише переключения символов пишется АБВ */
+              val cyrillic = setOf("ru", "uk", "be", "kk", "bg", "sr", "ky", "mn")
+
+              /** Для грузинского Shift даёт другие буквы, а не заглавные */
+              private val kaShift = mapOf("წ" to "ჭ", "რ" to "ღ", "ტ" to "თ", "ს" to "შ", "ჯ" to "ჟ", "ზ" to "ძ", "ც" to "ჩ")
+
+              private val baseLetters = mapOf(
                   "ru" to listOf("йцукенгшщзхъ", "фывапролджэ", "ячсмитьбю"),
                   "en" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
                   "uk" to listOf("йцукенгшщзхї", "фівапролджє", "ячсмитьбюґ"),
@@ -1289,8 +2257,70 @@ jobs:
                   "tr" to listOf("ertyuıopğü", "asdfghjklşi", "zcvbnmöç")
               )
 
+              private val qw = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
+              private val qz = listOf("qwertzuiop", "asdfghjkl", "yxcvbnm")
+              private val cy = listOf("йцукенгшщзхъ", "фывапролджэ", "ячсмитьбю")
+
+              private val extraLetters = mapOf(
+                  "be" to listOf("йцукенгшўзх", "фывапролджэ", "ячсмітьбю"),
+                  "kk" to cy,
+                  "ky" to cy,
+                  "mn" to cy,
+                  "uz" to qw,
+                  "az" to qw,
+                  "ka" to listOf("ქწერტყუიოპ", "ასდფგჰჯკლ", "ზხცვბნმ"),
+                  "hy" to listOf("քոեռտըւիօպխծ", "ասդֆգհջկլ", "զղցվբնմ"),
+                  "bg" to listOf("чшертъуиопя", "асдфгхйкл", "зьцжбнмю"),
+                  "sr" to listOf("љњертзуиопшђ", "асдфгхјклчћ", "жџцвбнм"),
+                  "cs" to qz,
+                  "sk" to qz,
+                  "ro" to qw,
+                  "hu" to qz,
+                  "nl" to qw,
+                  "sv" to listOf("qwertyuiopå", "asdfghjklöä", "zxcvbnm"),
+                  "no" to listOf("qwertyuiopå", "asdfghjkløæ", "zxcvbnm"),
+                  "da" to listOf("qwertyuiopå", "asdfghjkløæ", "zxcvbnm"),
+                  "fi" to listOf("qwertyuiopå", "asdfghjklöä", "zxcvbnm"),
+                  "el" to listOf("ςερτυθιοπ", "ασδφγηξκλ", "ζχψωβνμ"),
+                  "he" to listOf("קראטוןםפ", "שדגכעיחלךף", "זסבהנמצתץ"),
+                  "ar" to listOf("ضصثقفغعهخح", "شسيبلاتنمك", "ئءؤرىةوزظط"),
+                  "hr" to qz,
+                  "lt" to qw,
+                  "lv" to qw,
+                  "et" to listOf("qwertyuiopü", "asdfghjklöä", "zxcvbnm"),
+                  "id" to qw,
+                  "ms" to qw,
+                  "vi" to qw
+              )
+
+              val letters: Map<String, List<String>> = baseLetters + extraLetters
+
+              private val extraLong: Map<String, Map<String, String>> = mapOf(
+                  "be" to mapOf("е" to "ё"),
+                  "kk" to mapOf("а" to "ә", "н" to "ң", "г" to "ғ", "у" to "ү", "к" to "қ", "о" to "ө", "х" to "һ", "и" to "і", "ы" to "ұ"),
+                  "ky" to mapOf("н" to "ң", "о" to "ө", "у" to "ү"),
+                  "mn" to mapOf("о" to "ө", "у" to "ү"),
+                  "uz" to mapOf("o" to "oʻ", "g" to "gʻ"),
+                  "az" to mapOf("e" to "ə", "o" to "ö", "u" to "ü", "g" to "ğ", "s" to "ş", "c" to "ç", "i" to "ı"),
+                  "cs" to mapOf("a" to "á", "c" to "č", "d" to "ď", "e" to "ě", "i" to "í", "n" to "ň", "o" to "ó", "r" to "ř", "s" to "š", "t" to "ť", "u" to "ú", "y" to "ý", "z" to "ž"),
+                  "sk" to mapOf("a" to "á", "c" to "č", "d" to "ď", "e" to "é", "i" to "í", "l" to "ľ", "n" to "ň", "o" to "ô", "r" to "ŕ", "s" to "š", "t" to "ť", "u" to "ú", "y" to "ý", "z" to "ž"),
+                  "ro" to mapOf("a" to "ă", "i" to "î", "s" to "ș", "t" to "ț"),
+                  "hu" to mapOf("a" to "á", "e" to "é", "i" to "í", "o" to "ö", "u" to "ü"),
+                  "nl" to mapOf("e" to "é", "i" to "ï"),
+                  "hr" to mapOf("c" to "č", "s" to "š", "z" to "ž", "d" to "đ"),
+                  "lt" to mapOf("a" to "ą", "c" to "č", "e" to "ė", "i" to "į", "s" to "š", "u" to "ū", "z" to "ž"),
+                  "lv" to mapOf("a" to "ā", "c" to "č", "e" to "ē", "g" to "ģ", "i" to "ī", "k" to "ķ", "l" to "ļ", "n" to "ņ", "s" to "š", "u" to "ū", "z" to "ž"),
+                  "et" to mapOf("o" to "õ", "s" to "š", "z" to "ž"),
+                  "vi" to mapOf("a" to "â", "e" to "ê", "o" to "ô", "d" to "đ"),
+                  "fi" to mapOf("s" to "š"),
+                  "sv" to mapOf("e" to "é"),
+                  "bg" to mapOf("и" to "ѝ")
+              )
+
               /** Что вводится долгим нажатием: язык → (буква → вариант) */
-              val longPress: Map<String, Map<String, String>> = mapOf(
+              val longPress: Map<String, Map<String, String>> by lazy { baseLong + extraLong }
+
+              private val baseLong: Map<String, Map<String, String>> = mapOf(
                   "ru" to mapOf("е" to "ё"),
                   "de" to mapOf("a" to "ä", "o" to "ö", "u" to "ü", "s" to "ß"),
                   "fr" to mapOf("e" to "é", "a" to "à", "u" to "ù", "c" to "ç", "i" to "î", "o" to "ô"),
@@ -1328,7 +2358,8 @@ jobs:
                           val ch = it.toString()
                           Key(
                               if (!shift) ch
-                              else if (lang == "tr") ch.uppercase(java.util.Locale("tr"))
+                              else if (lang == "ka") (kaShift[ch] ?: ch)
+                              else if (lang == "tr" || lang == "az") ch.uppercase(java.util.Locale("tr"))
                               else ch.uppercase()
                           )
                       }
@@ -1359,7 +2390,7 @@ jobs:
                   }
 
                   val langName = names[lang] ?: lang
-                  val cyr = lang == "ru" || lang == "uk"
+                  val cyr = lang in cyrillic
                   val symLabel = if (sym) (if (cyr) "АБВ" else "ABC") else "?123"
                   val bottom = ArrayList<Key>()
                   bottom.add(Key(symLabel, "", Kind.SYMBOLS, 1.4f))
@@ -1379,6 +2410,33 @@ jobs:
            * kind: 0 — обычная, 1 — выделенная, 2 — текст состояния, 3 — текст ошибки
            */
           class Chip(val id: String, val label: String, val kind: Int = 0)
+
+          /**
+           * Ячейка панели (эмодзи, буфер, ИИ).
+           * kind: 0 — кнопка, 1 — выделенная кнопка, 2 — просто символ (эмодзи), 3 — строка списка слева
+           */
+          class Cell(val id: String, val label: String, val kind: Int = 0)
+          HRN_EOF
+          mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/MicActivity.kt')"
+          cat > 'app/src/main/java/ru/horrons/keyboard/MicActivity.kt' <<'HRN_EOF'
+          package ru.horrons.keyboard
+
+          import android.Manifest
+          import android.app.Activity
+          import android.os.Bundle
+
+          /** Прозрачное окно: просит у пользователя доступ к микрофону для голосового ввода и сразу закрывается. */
+          class MicActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  finish()
+              }
+          }
           HRN_EOF
           mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/Prefs.kt')"
           cat > 'app/src/main/java/ru/horrons/keyboard/Prefs.kt' <<'HRN_EOF'
@@ -1389,6 +2447,7 @@ jobs:
 
           /** Настройки клавиатуры. Хранятся в SharedPreferences и общие для сервиса и экрана настроек. */
           class Prefs(ctx: Context) {
+
               private val sp: SharedPreferences = ctx.getSharedPreferences("kb", Context.MODE_PRIVATE)
 
               var theme: Int
@@ -1510,13 +2569,61 @@ jobs:
 
               fun themeObj(): KbTheme =
                   if (theme == Themes.all.size) Themes.custom(customBg, customAccent) else Themes.get(theme)
+
+              // ----- Horrons AI, словари, панели, фон -----
+              var aiOn: Boolean
+                  get() = sp.getBoolean("aiOn", aiKey.isNotBlank())
+                  set(v) { sp.edit().putBoolean("aiOn", v).apply() }
+
+              var suggest: Boolean
+                  get() = sp.getBoolean("suggest", true)
+                  set(v) { sp.edit().putBoolean("suggest", v).apply() }
+
+              var autoCorrect: Boolean
+                  get() = sp.getBoolean("autoCorrect", false)
+                  set(v) { sp.edit().putBoolean("autoCorrect", v).apply() }
+
+              var learn: Boolean
+                  get() = sp.getBoolean("learn", true)
+                  set(v) { sp.edit().putBoolean("learn", v).apply() }
+
+              var perAppLang: Boolean
+                  get() = sp.getBoolean("perAppLang", true)
+                  set(v) { sp.edit().putBoolean("perAppLang", v).apply() }
+
+              var clipHistory: Boolean
+                  get() = sp.getBoolean("clipHistory", true)
+                  set(v) { sp.edit().putBoolean("clipHistory", v).apply() }
+
+              var bgImage: Boolean
+                  get() = sp.getBoolean("bgImage", false)
+                  set(v) { sp.edit().putBoolean("bgImage", v).apply() }
+
+              /** Затемнение фона-картинки, 0..90 */
+              var bgDim: Int
+                  get() = sp.getInt("bgDim", 45)
+                  set(v) { sp.edit().putInt("bgDim", v).apply() }
+
+              var recentEmoji: String
+                  get() = sp.getString("recentEmoji", "") ?: ""
+                  set(v) { sp.edit().putString("recentEmoji", v).apply() }
+
+              fun appLang(pkg: String): String? = sp.getString("app_$pkg", null)
+              fun setAppLang(pkg: String, lang: String) {
+                  sp.edit().putString("app_$pkg", lang).apply()
+              }
           }
           HRN_EOF
           mkdir -p "$(dirname 'app/src/main/java/ru/horrons/keyboard/SettingsActivity.kt')"
           cat > 'app/src/main/java/ru/horrons/keyboard/SettingsActivity.kt' <<'HRN_EOF'
           package ru.horrons.keyboard
 
+          import android.Manifest
           import android.app.Activity
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.widget.Toast
+          import java.io.File
           import android.content.Intent
           import android.graphics.Typeface
           import android.os.Bundle
@@ -1551,6 +2658,7 @@ jobs:
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   p = Prefs(this)
+                  Dict.init(this)
 
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -1783,6 +2891,99 @@ jobs:
                   root.addView(title("Верхняя панель"))
                   sw("Подсказка из буфера обмена", { p.clipSuggest }, { p.clipSuggest = it })
                   sw("Прятать подсказку после вставки", { p.clipClose }, { p.clipClose = it })
+                  sw("История буфера обмена (хранится только в памяти, до перезапуска клавиатуры)", { p.clipHistory }, { p.clipHistory = it })
+
+                  // 5d. Подсказки и словарь
+                  root.addView(title("Подсказки и словарь"))
+                  root.addView(note("Над клавиатурой появляются варианты слов и предсказание следующего слова. Встроенный словарь небольшой, он пополняется тем, что вы печатаете (слово запоминается после второго использования). Всё хранится только на телефоне и не работает в полях паролей. Для серьёзной проверки текста используйте кнопки Horrons AI."))
+                  sw("Подсказки слов", { p.suggest }, { p.suggest = it })
+                  sw("Автоисправление опечаток (осторожно: словарь небольшой; Backspace сразу после исправления вернёт ваше слово)", { p.autoCorrect }, { p.autoCorrect = it })
+                  sw("Обучаться на моём вводе", { p.learn }, { p.learn = it })
+                  sw("Запоминать язык для каждого приложения", { p.perAppLang }, { p.perAppLang = it })
+                  val dictLabel = TextView(this)
+                  fun updDict() {
+                      dictLabel.text = "Слов в личном словаре: ${Dict.userCount()}"
+                  }
+                  updDict()
+                  root.addView(dictLabel)
+                  val wordBox = EditText(this).apply {
+                      hint = "Новое слово для словаря"
+                      setSingleLine()
+                  }
+                  root.addView(wordBox)
+                  root.addView(Button(this).apply {
+                      text = "Добавить слово"
+                      setOnClickListener {
+                          val w = wordBox.text.toString().trim()
+                          val cyr = w.any { it in 'а'..'я' || it in 'А'..'Я' || it == 'ё' || it == 'Ё' || it == 'і' || it == 'є' || it == 'ї' || it == 'ґ' }
+                          val langs = p.langs
+                          val lg = if (cyr) (langs.firstOrNull { it == "ru" || it == "uk" } ?: "ru")
+                          else (langs.firstOrNull { it != "ru" && it != "uk" } ?: "en")
+                          if (Dict.add(lg, w)) {
+                              wordBox.setText("")
+                              updDict()
+                              Toast.makeText(this@SettingsActivity, "Слово добавлено", Toast.LENGTH_SHORT).show()
+                          } else {
+                              Toast.makeText(this@SettingsActivity, "Нужно слово из букв, 2–24 символа", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Очистить личный словарь"
+                      setOnClickListener {
+                          Dict.clearUser()
+                          updDict()
+                          Toast.makeText(this@SettingsActivity, "Словарь очищен", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+
+                  // 5e. Фон-картинка
+                  root.addView(title("Фон клавиатуры"))
+                  root.addView(note("Можно поставить свою фотографию из галереи. Она сохраняется только в памяти приложения."))
+                  root.addView(Button(this).apply {
+                      text = "Выбрать фото из галереи"
+                      setOnClickListener {
+                          val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                          i.addCategory(Intent.CATEGORY_OPENABLE)
+                          i.type = "image/*"
+                          startActivityForResult(i, 77)
+                      }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Убрать фон"
+                      setOnClickListener {
+                          p.bgImage = false
+                          File(filesDir, "bg.jpg").delete()
+                          Toast.makeText(this@SettingsActivity, "Фон убран", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+                  val dimLabel = TextView(this)
+                  fun updDim() {
+                      dimLabel.text = "Затемнение фона: ${p.bgDim}%"
+                  }
+                  updDim()
+                  root.addView(dimLabel)
+                  root.addView(SeekBar(this).apply {
+                      max = 90
+                      progress = p.bgDim.coerceIn(0, 90)
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(sb: SeekBar, value: Int, fromUser: Boolean) {
+                              p.bgDim = value
+                              updDim()
+                          }
+
+                          override fun onStartTrackingTouch(sb: SeekBar) {}
+                          override fun onStopTrackingTouch(sb: SeekBar) {}
+                      })
+                  })
+
+                  // 5f. Голос и эмодзи
+                  root.addView(title("Голос, эмодзи, буфер"))
+                  root.addView(note("Кнопка 🎤 в верхней панели включает голосовой ввод. Речь распознаёт сервис телефона (обычно Google), нужен интернет. Кнопка 😀 открывает эмодзи и историю буфера обмена. GIF в этой версии нет."))
+                  root.addView(Button(this).apply {
+                      text = "Разрешить микрофон"
+                      setOnClickListener { requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 5) }
+                  })
 
                   // 6. Переводчик
                   root.addView(title("Переводчик"))
@@ -1827,9 +3028,39 @@ jobs:
                       })
                   }
                   edit("Адрес сервера (пусто = по ключу)", p.aiUrl, false) { p.aiUrl = it }
-                  edit("Ключ API", p.aiKey, true) { p.aiKey = it }
+                  sw("Включить Horrons AI (текст из поля отправляется выбранному сервису только когда вы нажимаете действие)", { p.aiOn }, { p.aiOn = it })
+                  edit("Ключ API", p.aiKey, true) {
+                      val was = p.aiKey.isBlank()
+                      p.aiKey = it
+                      if (was && it.isNotBlank()) p.aiOn = true
+                  }
                   edit("Модель (пусто = по ключу)", p.aiModel, false) { p.aiModel = it }
                   root.addView(note("Как пользоваться: напиши текст в любом поле, нажми «✨ Horrons AI» и выбери действие. «Спросить» отправит написанное как вопрос и заменит его ответом."))
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != 77 || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  try {
+                      val opts = BitmapFactory.Options()
+                      opts.inJustDecodeBounds = true
+                      contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+                      var sample = 1
+                      while (opts.outWidth / sample > 1400 || opts.outHeight / sample > 1400) sample *= 2
+                      val o2 = BitmapFactory.Options()
+                      o2.inSampleSize = sample
+                      val bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o2) }
+                      if (bmp == null) {
+                          Toast.makeText(this, "Не удалось открыть картинку", Toast.LENGTH_SHORT).show()
+                          return
+                      }
+                      File(filesDir, "bg.jpg").outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+                      p.bgImage = true
+                      Toast.makeText(this, "Фон установлен", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Не удалось установить фон", Toast.LENGTH_SHORT).show()
+                  }
               }
           }
           HRN_EOF
