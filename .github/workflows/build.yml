@@ -987,7 +987,7 @@ jobs:
 
               // ================= панели =================
 
-              fun setPanel(p: Int) {
+              fun showPanel(p: Int) {
                   panel = p
                   panelVer++
                   if (p != 0) mode = 0
@@ -1082,14 +1082,14 @@ jobs:
               fun onCell(id: String) {
                   if (id.isEmpty()) return
                   when {
-                      id == "abc" -> setPanel(0)
+                      id == "abc" -> showPanel(0)
                       id == "bs" -> backspace()
-                      id == "emoji" -> setPanel(1)
-                      id == "clips" -> setPanel(2)
-                      id == "ai" -> setPanel(3)
+                      id == "emoji" -> showPanel(1)
+                      id == "clips" -> showPanel(2)
+                      id == "ai" -> showPanel(3)
                       id == "undo" -> {
                           doUndo()
-                          setPanel(0)
+                          showPanel(0)
                       }
                       id == "hclear" -> {
                           clipHist.clear()
@@ -1098,7 +1098,7 @@ jobs:
                       }
                       id == "insert" -> {
                           currentInputConnection?.commitText(aiResult, 1)
-                          setPanel(0)
+                          showPanel(0)
                           afterEdit()
                       }
                       id.startsWith("cat:") -> {
@@ -1112,7 +1112,7 @@ jobs:
                           val t = clipHist.getOrNull(i)
                           if (t != null) {
                               currentInputConnection?.commitText(t, 1)
-                              setPanel(0)
+                              showPanel(0)
                               afterEdit()
                           }
                       }
@@ -1174,15 +1174,15 @@ jobs:
                           kv?.invalidate()
                       }
                       "ai" -> {
-                          if (!prefs.aiOn) setStatus("Horrons AI выключен в настройках приложения", true, 4000) else setPanel(3)
+                          if (!prefs.aiOn) setStatus("Horrons AI выключен в настройках приложения", true, 4000) else showPanel(3)
                       }
-                      "emoji" -> setPanel(1)
+                      "emoji" -> showPanel(1)
                       "mic" -> startVoice()
                       "tools" -> {
                           toolsOpen = true
                           kv?.invalidate()
                       }
-                      "pclose" -> setPanel(0)
+                      "pclose" -> showPanel(0)
                       "close" -> {
                           mode = 0
                           setStatus(null)
@@ -1331,11 +1331,11 @@ jobs:
                                   "explain" -> {
                                       aiResult = res
                                       setStatus(null)
-                                      setPanel(4)
+                                      showPanel(4)
                                   }
                                   "cont" -> {
                                       if (appendJob(job, res)) {
-                                          setPanel(0)
+                                          showPanel(0)
                                           setStatus("Готово", false, 1200)
                                           afterEdit()
                                       } else {
@@ -1344,7 +1344,7 @@ jobs:
                                   }
                                   else -> {
                                       if (applyJob(job, res)) {
-                                          setPanel(0)
+                                          showPanel(0)
                                           setStatus("Готово", false, 1200)
                                           afterEdit()
                                       } else {
